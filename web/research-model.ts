@@ -78,7 +78,7 @@ export function fundingTotal(series: ResearchSeries | undefined, days: number) {
   const regular = series.points.filter(p => !p.rateType || p.rateType === 'Regular');
   const window = regular.filter(p => p.time >= start - DAY && p.time <= end);
   const gap = window.some((p, i) => i > 0 && p.time - window[i - 1].time > 12 * 3600);
-  const partial = !rows.length || series.points[0]?.time > start || gap || end - (regular.at(-1)?.time ?? 0) > 12 * 3600 || !!series.warning;
+  const partial = !rows.length || series.points[0]?.time > start || gap || end - (regular.at(-1)?.time ?? 0) > 12 * 3600;
   return { value: rows.length ? rows.reduce((sum, p) => sum + p.value * 100, 0) : undefined, count: rows.length, partial };
 }
 export function stale(series: ResearchSeries | undefined) {
@@ -88,4 +88,73 @@ export function stale(series: ResearchSeries | undefined) {
   const step = seconds[series.interval as ResearchPeriod];
   const sourceLag = series.dataset === 'funding' ? 12 * 3600 : series.dataset === 'reference' ? 180 : step ? step + 600 : Infinity;
   return series.cached || now - series.fetchedAt > ttl || now - series.sourceTime > sourceLag;
+}
+
+export type SummaryID = 'ratio' | 'interest' | 'funding' | 'flow' | 'risk';
+export const summaryIDs: SummaryID[] = ['ratio', 'interest', 'funding', 'flow', 'risk'];
+export const summaryRequests: Record<SummaryID, [Dataset, ResearchPeriod][]> = {
+  ratio: [['ratio', '1h']], interest: [['interest', '1h']], funding: [['funding', '1h']],
+  flow: [['spot', '1h'], ['perpetual', '1h']], risk: [['perpetual', '1d']],
+};
+export interface SummaryMetric {
+  id: SummaryID; value?: number; secondary?: number; change?: number; absoluteChange?: number;
+  start?: number; end?: number; fetchedAt?: number; incomplete: boolean; stale: boolean;
+  sources: ResearchSeries[];
+}
+
+/** Fixed summary windows never inherit the chart period or the campaign anchor. */
+export function summarize(id: SummaryID, data: (dataset: Dataset, period: ResearchPeriod) => ResearchSeries | undefined): SummaryMetric {
+  const inputs = summaryRequests[id].map(([dataset, period]) => data(dataset, period));
+  const sources = inputs.filter((s): s is ResearchSeries => !!s);
+  const result: SummaryMetric = { id, incomplete: true, stale: sources.some(stale), sources,
+    fetchedAt: sources.length ? Math.min(...sources.map(s => s.fetchedAt)) : undefined };
+  if (id === 'flow') {
+    if (result.fetchedAt == null) return result;
+    // Available markets use the same 24 complete hours, as of the older fetch.
+    const end = Math.floor(result.fetchedAt / 3600) * 3600, start = end - DAY;
+    const share = (series?: ResearchSeries) => {
+      const bars = closed(series).filter(b => b.time >= start && b.time < end);
+      if (bars.length !== 24 || bars.some((b, i) => b.time !== start + i * 3600)) return undefined;
+      const volume = bars.reduce((sum, b) => sum + b.volume, 0);
+      return volume > 0 ? bars.reduce((sum, b) => sum + b.takerBuy, 0) / volume * 100 : undefined;
+    };
+    result.start = start; result.end = end; result.value = share(inputs[0]); result.secondary = share(inputs[1]);
+    result.incomplete = result.value == null || result.secondary == null;
+    return result;
+  }
+  const first = inputs[0];
+  if (!first) return result;
+  if (id === 'ratio') {
+    const bars = closed(first), last = bars.at(-1);
+    if (!last) return result;
+    const previous = bars.find(b => b.time === last.time - 7 * DAY);
+    result.value = last.close; result.start = last.time + 3600 - 7 * DAY; result.end = last.time + 3600;
+    result.change = previous ? (last.close / previous.close - 1) * 100 : undefined;
+    result.incomplete = !previous;
+  } else if (id === 'interest') {
+    const last = first.points.at(-1);
+    if (!last) return result;
+    const previous = first.points.find(p => p.time === last.time - DAY);
+    result.value = last.value; result.start = last.time - DAY; result.end = last.time;
+    result.absoluteChange = previous ? last.value - previous.value : undefined;
+    result.change = previous && previous.value > 0 ? (last.value / previous.value - 1) * 100 : undefined;
+    result.incomplete = result.change == null;
+  } else if (id === 'funding') {
+    const total = fundingTotal(first, 7);
+    result.value = total.value; result.secondary = total.count;
+    result.start = first.fetchedAt - 7 * DAY; result.end = first.fetchedAt; result.incomplete = total.partial;
+  } else {
+    const bars = closed(first), last = bars.at(-1), previous = bars.at(-2);
+    const atr = new Map(atr14(first).map(p => [p.time, p.value]));
+    const current = last && atr.get(last.time), prior = previous && atr.get(previous.time);
+    result.value = current != null && last ? current / last.close * 100 : undefined;
+    result.secondary = current; result.start = last?.time; result.end = last ? last.time + DAY : undefined;
+    result.change = result.value != null && prior != null && previous && last!.time - previous.time === DAY ? result.value - prior / previous.close * 100 : undefined;
+    result.incomplete = result.value == null || result.change == null;
+  }
+  if ((id === 'ratio' || id === 'risk') && result.end != null) {
+    const step = id === 'risk' ? DAY : 3600;
+    result.stale ||= result.end < Math.floor(first.fetchedAt / step) * step;
+  }
+  return result;
 }

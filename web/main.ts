@@ -4,6 +4,9 @@ import {
 } from 'lightweight-charts';
 import './style.css';
 import { ResearchView } from './research';
+import { ResearchStore } from './research-store';
+import { MarketSummary } from './market-summary';
+import type { SummaryID } from './research-model';
 import './research.css';
 
 type AssetID = 'btc' | 'eth' | 'us10y' | 'us30y' | 'gold';
@@ -121,9 +124,10 @@ window.receiveNative = (message: string) => {
   } else if (value.type === 'visibility') {
     const wasVisible = visible;
     visible = value.visible;
+    summary.setActive(visible && bridgeReady && !observing() && selected === 'eth');
     if (visible && !wasVisible) { if (observing()) research.tick(true); else void loadHistory(false, true); }
   } else if (value.type === 'wake' && visible) {
-    if (observing()) research.tick(true); else void loadHistory(false, true);
+    if (observing()) research.tick(true); else { void loadHistory(false, true); void summary.refresh(); }
   }
 };
 
@@ -153,6 +157,7 @@ byId('app').innerHTML = `
           <div class="range-track"><span id="range-marker"></span></div><div class="range-caption">低点<span>高点</span></div>
         </div>
       </section>
+      <section id="market-summary" aria-label="ETH 核心观察指标" hidden></section>
       <section class="chart-toolbar" aria-label="图表工具">
         <div class="intervals" role="group" aria-label="K 线周期">${(Object.keys(intervalLabels) as Interval[]).map(i => `<button data-interval="${i}" aria-pressed="false">${intervalLabels[i]}</button>`).join('')}</div>
         <div class="chart-controls"><button id="open-research" class="open-research" title="进入 ETH 合约观察二级页面" hidden>ETH 合约观察 →</button><button id="sma20" class="indicator-button" aria-pressed="true"><i class="ma20-dot"></i>MA 20</button><button id="sma50" class="indicator-button" aria-pressed="false"><i class="ma50-dot"></i>MA 50</button>
@@ -210,7 +215,11 @@ const ma50 = chart.addSeries(LineSeries, { color: '#a99ae8', lineWidth: 1, price
 const volume = chart.addSeries(HistogramSeries, { priceFormat: { type: 'volume' }, priceLineVisible: false, lastValueVisible: false }, 1);
 volume.priceScale().applyOptions({ scaleMargins: { top: 0.15, bottom: 0 } });
 
-const research = new ResearchView(byId('research-workspace'), native, (source, time, stale, period) => {
+const researchStore = new ResearchStore(native);
+const summary = new MarketSummary(byId('market-summary'), researchStore, openResearch);
+let returnMetric: SummaryID | undefined;
+let marketRange: { from: Time; to: Time } | null = null;
+const research = new ResearchView(byId('research-workspace'), native, researchStore, (source, time, stale, period) => {
   if (!observing()) return;
   byId('source-name').textContent = source;
   byId('quote-time').textContent = time;
@@ -227,14 +236,26 @@ function renderView() {
   byId('research-back').hidden = !observing();
   byId('open-research').hidden = selected !== 'eth';
   byId('market-workspace').hidden = observing();
+  byId('market-summary').hidden = selected !== 'eth';
+  summary.setActive(!observing() && selected === 'eth' && bridgeReady && visible);
   research.setActive(observing() && bridgeReady);
 }
-byId('open-research').addEventListener('click', () => {
+function openResearch(metric?: SummaryID) {
+  marketRange = chart.timeScale().getVisibleRange(); returnMetric = metric;
+  historyRequest++; loading = false;
+  research.openMetric(metric);
   page = 'research'; clearInspection(); renderView(); byId('research-back').focus();
-});
+}
+byId('open-research').addEventListener('click', () => openResearch());
 function returnToMarket() {
-  page = 'market'; renderSelection(); byId('open-research').focus();
-  void loadHistory(false, true);
+  page = 'market'; renderSelection();
+  if (returnMetric) summary.focus(returnMetric); else byId('open-research').focus();
+  const targetAsset = selected, targetInterval = interval;
+  requestAnimationFrame(() => requestAnimationFrame(() => {
+    if (observing() || selected !== targetAsset || interval !== targetInterval) return;
+    if (marketRange && history?.candles.length) chart.timeScale().setVisibleRange(marketRange);
+    void loadHistory(false, true);
+  }));
 }
 byId('research-back').addEventListener('click', returnToMarket);
 
@@ -523,6 +544,7 @@ async function refresh() {
   await Promise.allSettled([
     native<Snapshot>('refresh').then(value => { snapshot = value; renderQuotes(); }).catch(error => { historyError = error.message; renderNotice(); }),
     observing() ? research.refresh(true) : loadHistory(true, true),
+    summary.refresh(true),
   ]);
   byId('refresh').classList.remove('refreshing');
   byId<HTMLButtonElement>('refresh').disabled = false;
@@ -635,6 +657,7 @@ void native<{ snapshot: Snapshot; preferences: Preferences; visible: boolean; tr
   return loadHistory();
 }).catch(error => { chartState(error.message, true); byId('connection').innerHTML = '<i></i>等待原生应用'; });
 setInterval(() => {
+  if (visible) summary.tick();
   if (visible && observing()) { research.tick(); return; }
   const refreshEvery = interval === '1m' ? 15000 : 60000;
   if (visible && !loading && Date.now() - lastHistoryRequestAt >= refreshEvery) void loadHistory(false, true);

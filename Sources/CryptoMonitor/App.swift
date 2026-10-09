@@ -293,7 +293,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
                 researchInterval = interval
             }
             reply(id, payload: true)
-        case "research":
+        case "research", "researchCached":
             guard let raw = body["dataset"] as? String, let dataset = ResearchDataset(rawValue: raw),
                   let interval = body["interval"] as? String else {
                 reply(id, error: "无效的观察数据请求。")
@@ -301,6 +301,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
             }
             let force = body["force"] as? Bool ?? false
             Task {
+                if action == "researchCached" {
+                    let cached = await research.cachedSeries(dataset, interval: interval)
+                    reply(id, payload: cached.map { jsonObject($0) } ?? NSNull())
+                    return
+                }
                 do { reply(id, payload: jsonObject(try await research.series(dataset, interval: interval, force: force))) }
                 catch { reply(id, error: error.localizedDescription) }
             }

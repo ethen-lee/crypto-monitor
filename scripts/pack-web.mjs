@@ -13,8 +13,9 @@ const hash = createHash('sha256').update(script).digest('base64');
 html = html.replace(scriptMatch[0], '');
 if (styleMatch) {
   const style = await readFile(new URL(styleMatch[1], root), 'utf8');
-  html = html.replace(styleMatch[0], `<style>${style}</style>`);
+  html = html.replace(styleMatch[0], () => `<style>${style}</style>`);
 }
 html = html.replace("script-src 'self'", `script-src 'sha256-${hash}'`);
-html = html.replace('</body>', `<script>${script}</script></body>`);
+// A replacement callback preserves literal $ sequences in the generated bundle.
+html = html.replace('</body>', () => `<script>${script}</script></body>`);
 await writeFile(new URL('index.html', root), html);

@@ -1,0 +1,36 @@
+.market-summary { flex-shrink: 0; padding: 0 0 10px; }
+.summary-caption { display: flex; justify-content: space-between; align-items: baseline; color: #bcc9df; font-size: 10px; margin-bottom: 7px; }
+.summary-caption small { color: var(--muted); font-size: 9px; font-weight: 400; margin-left: 8px; }
+.summary-caption > span:last-child { color: var(--muted); font-size: 9px; }
+.summary-metrics { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); }
+.summary-metric { min-width: 0; text-align: left; padding: 1px 12px 2px; border-left: 1px solid var(--line); border-radius: 0; display: flex; flex-direction: column; gap: 3px; font-variant-numeric: tabular-nums; }
+.summary-metric:first-child { border-left: 0; padding-left: 0; }
+.summary-metric:hover { background: #22344c; }
+.summary-metric:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
+.summary-label { font-size: 10px; color: #b6c6dc; }
+.summary-label i { font-style: normal; color: #8199b6; padding-left: 3px; }
+.summary-metric strong { font-size: 17px; line-height: 1.2; color: #e2eafa; font-weight: 550; letter-spacing: -.3px; white-space: nowrap; }
+.summary-hint { color: #a9bdd6; font-size: 9px; white-space: nowrap; }
+.summary-time { color: #8298b3; font-size: 8px; min-height: 10px; white-space: nowrap; }
+.summary-warning .summary-time, .summary-warning { color: #e9cf9a; }
+.research-focus { display: flex; align-items: center; gap: 18px; padding: 0 0 12px; flex-shrink: 0; }
+.focus-reading { display: flex; flex-direction: column; gap: 5px; min-width: 175px; font-variant-numeric: tabular-nums; }
+.focus-reading > span { font-size: 10px; color: #becafd; }
+.focus-reading strong { font-size: 21px; font-weight: 550; }
+.focus-reading small { color: #bacbe0; font-size: 9px; }
+.focus-context { flex: 1; min-width: 0; }
+.focus-context p { margin: 0 0 4px; color: #c0d0e2; font-size: 10px; line-height: 1.5; }
+.focus-context small { display: block; color: var(--muted); font-size: 9px; line-height: 1.5; }
+.research-pane-labels > .is-focused { color: #d2dcff; border-left: 2px solid #a5b5ff; }
+@media (max-width: 790px) {
+  .summary-metric { padding-left: 8px; padding-right: 5px; }
+  .summary-metric strong { font-size: 14px; }
+  .summary-caption > span:last-child { display: none; }
+  .focus-reading { min-width: 140px; }
+}
+@media (max-height: 760px) {
+  .market-summary { padding-bottom: 6px; }
+  .summary-caption { margin-bottom: 4px; }
+  .summary-metric { gap: 2px; }
+  .research-focus { padding-bottom: 8px; }
+}

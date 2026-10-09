@@ -1,9 +1,11 @@
 import { createChart, CandlestickSeries, LineSeries, HistogramSeries, ColorType, CrosshairMode,
   type IChartApi, type ISeriesApi, type SeriesType, type Time, type UTCTimestamp, type MouseEventParams } from 'lightweight-charts';
-import { type ResearchSeries, type ResearchPeriod, type Dataset, type Anchor, type ValuePoint,
-  DAY, seconds, utcDate, utcTime, anchorTime, closed, anchoredFlow, relativeReturns, atr14, fundingTotal, stale } from './research-model';
+import { type ResearchPeriod, type Dataset, type Anchor, type ValuePoint,
+  DAY, seconds, utcDate, utcTime, anchorTime, closed, anchoredFlow, relativeReturns, atr14, fundingTotal, stale,
+  type SummaryID, summaryRequests } from './research-model';
+import { ResearchStore, researchKey, type Native } from './research-store';
+import { metricDetailHTML } from './market-summary';
 
-type Native = <T>(action: string, args?: Record<string, unknown>) => Promise<T>;
 type Tab = 'trend' | 'leverage' | 'flow' | 'risk';
 const titles: Record<Tab, string> = { trend: '趋势与强弱', leverage: '杠杆与费率', flow: '主动成交', risk: '波动风险' };
 const names: Record<Dataset, string> = { perpetual: 'ETH 永续 K 线', spot: 'ETH 现货成交', bitcoin: 'BTC 现货 K 线', ratio: 'ETH/BTC 现货', interest: 'ETH 永续 OI', funding: 'ETH 永续资金费', reference: '标记价 / 指数价' };
@@ -20,9 +22,10 @@ export class ResearchView {
   private price: ISeriesApi<'Candlestick'>;
   private auxiliary: ISeriesApi<SeriesType>[] = [];
   private inspected = new Map<string, Map<number, number>>();
-  private series = new Map<string, ResearchSeries>();
-  private errors = new Map<string, string>();
-  private pending = new Map<string, Promise<void>>();
+  private get errors() { return this.store.errors; }
+  private get pending() { return this.store.pending; }
+  private focusedMetric?: SummaryID;
+  private updateFrame = 0;
   private active = false;
   private displayed = '';
   private tab: Tab = read('tab', 'trend');
@@ -34,7 +37,7 @@ export class ResearchView {
   private renderFrame = 0;
   private rendering = false;
 
-  constructor(private root: HTMLElement, private native: Native, private status: (text: string, time: string, stale: boolean, period: ResearchPeriod) => void) {
+  constructor(private root: HTMLElement, private native: Native, private store: ResearchStore, private status: (text: string, time: string, stale: boolean, period: ResearchPeriod) => void) {
     if (!(this.tab in titles)) this.tab = 'trend';
     if (!(this.period in periods)) this.period = '4h';
     if (!['7', '30', 'manual'].includes(this.anchor.mode) || (this.anchor.mode === 'manual' && !this.validDate(this.anchor.date))) this.anchor = { mode: '30', date: '' };
@@ -43,6 +46,7 @@ export class ResearchView {
       <div class="research-navigation"><div class="research-tabs" role="group" aria-label="观察指标">${Object.entries(titles).map(([key, title]) => `<button data-tab="${key}">${title}</button>`).join('')}</div><div class="intervals" role="group" aria-label="观察周期">${Object.entries(periods).map(([key, title]) => `<button data-period="${key}">${title}</button>`).join('')}</div></div>
       <div class="research-anchor"><span>本轮观察起点</span><div class="anchor-presets" role="group" aria-label="观察起点"><button data-anchor="7">近 7 天</button><button data-anchor="30">近 30 天</button><button data-anchor="manual">手动日期</button></div><input data-r="date" type="date" aria-label="手动观察起点，UTC 日期" hidden><span data-r="anchor-caption" class="anchor-caption"></span><button data-r="reset" class="research-text-button" title="回到观察窗口">重置视图</button></div>
       <div class="research-stats" data-r="stats" aria-live="polite"></div>
+      <div class="research-focus" data-r="focus" hidden aria-live="polite"></div>
       <div class="research-chart-head"><span data-r="ohlc">ETHUSDT · 永续成交 K 线</span><button data-r="flow-mode" class="research-text-button" hidden>改看主动买卖量</button><button data-r="scenario" class="research-text-button" hidden>资金费情景 ↗</button></div>
       <div class="research-chart-region"><div class="research-chart" data-r="chart" aria-label="ETH 价格与联动指标图，拖动平移、滚轮缩放"></div><div class="research-pane-labels" data-r="pane-labels" aria-hidden="true"></div><div class="chart-state" data-r="state"><span class="spinner"></span><strong>正在读取观察数据</strong></div><div class="chart-tooltip research-tooltip" data-r="tooltip" hidden></div></div>
       <div class="research-caption"><span data-r="interpretation"></span><button data-r="details" class="research-text-button">数据口径 ↗</button><button data-r="distributions" class="research-text-button">三类分布 ↗</button></div>
@@ -59,7 +63,7 @@ export class ResearchView {
     });
     this.price = this.chart.addSeries(CandlestickSeries, { upColor: '#65d6bd', downColor: '#ff8e99', borderVisible: false, wickUpColor: '#65d6bd', wickDownColor: '#ff8e99' });
     this.root.querySelectorAll<HTMLButtonElement>('[data-tab]').forEach(button => button.onclick = () => {
-      this.tab = button.dataset.tab as Tab; save('tab', this.tab); this.clearInspection(); this.render(); void this.refresh();
+      this.focusedMetric = undefined; this.tab = button.dataset.tab as Tab; save('tab', this.tab); this.clearInspection(); this.render(); void this.refresh();
     });
     this.root.querySelectorAll<HTMLButtonElement>('[data-period]').forEach(button => button.onclick = () => {
       if (this.period === button.dataset.period) return;
@@ -96,12 +100,19 @@ export class ResearchView {
     this.el('chart').onpointerleave = () => { if (!this.pinnedTime) this.clearInspection(); };
     this.el('chart').addEventListener('pointermove', event => { if (event.buttons) this.positionLabels(); });
     new ResizeObserver(() => this.positionLabels()).observe(this.el('chart'));
+    this.store.subscribe(key => {
+      if (!this.active) return;
+      if (this.needed().some(([d, p]) => this.key(d, p) === key)) {
+        cancelAnimationFrame(this.updateFrame);
+        this.updateFrame = requestAnimationFrame(() => this.render());
+      } else this.renderFocus();
+    });
   }
 
   private el<T extends HTMLElement = HTMLElement>(name: string) { return this.root.querySelector(`[data-r="${name}"]`) as T; }
   private validDate(value: string) { return /^\d{4}-\d{2}-\d{2}$/.test(value) && Number.isFinite(Date.parse(value)) && utcDate(Date.parse(value) / 1000) === value && value <= utcDate(); }
-  private key(dataset: Dataset, period = this.period) { return `${dataset}:${['funding', 'reference'].includes(dataset) ? 'all' : period}`; }
-  private data(dataset: Dataset, period = this.period) { return this.series.get(this.key(dataset, period)); }
+  private key(dataset: Dataset, period = this.period) { return researchKey(dataset, period); }
+  private data(dataset: Dataset, period = this.period) { return this.store.data(dataset, period); }
   private needed(): [Dataset, ResearchPeriod][] {
     const items: [Dataset, ResearchPeriod][] = [['perpetual', this.period], ['perpetual', '1d'], ['reference', this.period]];
     if (this.tab === 'trend') items.push(['spot', this.period], ['bitcoin', this.period], ['ratio', this.period]);
@@ -110,6 +121,31 @@ export class ResearchView {
     return items.filter(([d, p], i) => items.findIndex(([other, period]) => this.key(d, p) === this.key(other, period)) === i);
   }
   private context() { if (this.active) void this.native('researchContext', { active: true, interval: this.period }).catch(() => {}); }
+  openMetric(id?: SummaryID) {
+    this.focusedMetric = id;
+    if (id) {
+      this.tab = ({ ratio: 'trend', interest: 'leverage', funding: 'leverage', flow: 'flow', risk: 'risk' } as const)[id];
+      save('tab', this.tab);
+      if (id === 'flow') this.flowMode = 'volume';
+    }
+  }
+  private renderFocus() {
+    const focus = this.el('focus');
+    focus.hidden = !this.focusedMetric; this.el('stats').hidden = !!this.focusedMetric;
+    if (!this.focusedMetric) return;
+    const restoreFocus = focus.contains(document.activeElement);
+    focus.innerHTML = metricDetailHTML(this.store, this.focusedMetric);
+    const button = focus.querySelector<HTMLButtonElement>('[data-clear-focus]')!;
+    if (restoreFocus) button.focus();
+    button.onclick = () => {
+      this.focusedMetric = undefined; this.render();
+      this.root.querySelector<HTMLButtonElement>(`[data-tab="${this.tab}"]`)?.focus();
+    };
+  }
+  private requests() {
+    const items = [...this.needed(), ...(this.focusedMetric ? summaryRequests[this.focusedMetric] : [])];
+    return items.filter(([d, p], i) => items.findIndex(([other, period]) => this.key(d, p) === this.key(other, period)) === i);
+  }
   setActive(active: boolean) {
     const changed = this.active !== active;
     this.active = active; this.root.hidden = !active;
@@ -121,23 +157,8 @@ export class ResearchView {
   }
   async refresh(force = false) {
     if (!this.active) return;
-    await Promise.allSettled(this.needed().map(([dataset, period]) => this.fetch(dataset, period, force)));
+    await this.store.ensure(this.requests(), force);
     if (this.active) this.render();
-  }
-  private fetch(dataset: Dataset, period: ResearchPeriod, force: boolean): Promise<void> {
-    const key = this.key(dataset, period), pending = this.pending.get(key);
-    if (pending) return pending;
-    const previous = this.series.get(key);
-    const ttl = dataset === 'funding' || dataset === 'interest' || (dataset === 'perpetual' && period === '1d' && this.period !== '1d') ? 300 : 60;
-    if (!force && previous && !previous.cached && Date.now() / 1000 - previous.fetchedAt < ttl) return Promise.resolve();
-    const request = this.native<ResearchSeries>('research', { dataset, interval: period, force }).then(value => {
-      this.series.set(key, value); this.errors.delete(key);
-    }).catch(error => { this.errors.set(key, error instanceof Error ? error.message : '暂时无法读取数据'); }).finally(() => {
-      this.pending.delete(key);
-      if (this.active) this.render();
-    });
-    this.pending.set(key, request);
-    return request;
   }
   private stat(label: string, value: string, hint: string, accent = '') { return `<div><span>${label}</span><strong class="${accent}">${value}</strong><small>${hint}</small></div>`; }
 
@@ -219,8 +240,8 @@ export class ResearchView {
         if (flow.partial) issues.push(`${name} CVD 只能从 ${utcDate(flow.start!)} 累计；早期历史未覆盖。`);
         if (flow.gap) issues.push(`${name} CVD 在 ${utcTime(flow.end!)} 后遇到缺口，累计已停止。`);
       }
-      stats = this.stat('现货主动买入占比', `${n(spot.share)}%`, `买卖比 ${n(spot.ratio, 3)} · 量 ${compact(spot.buy)} / ${compact(spot.sell)} ETH`, 'blue')
-        + this.stat('永续主动买入占比', `${n(perp.share)}%`, `买卖比 ${n(perp.ratio, 3)} · 量 ${compact(perp.buy)} / ${compact(perp.sell)} ETH`, 'lavender')
+      stats = this.stat('本轮现货主动买入占比', `${n(spot.share)}%`, `买卖比 ${n(spot.ratio, 3)} · 量 ${compact(spot.buy)} / ${compact(spot.sell)} ETH`, 'blue')
+        + this.stat('本轮永续主动买入占比', `${n(perp.share)}%`, `买卖比 ${n(perp.ratio, 3)} · 量 ${compact(perp.buy)} / ${compact(perp.sell)} ETH`, 'lavender')
         + this.stat('本轮 CVD · 现货 / 永续', `${compact(spot.values.at(-1)?.value)} / ${compact(perp.values.at(-1)?.value)}`, 'ETH · 主动买入 − 主动卖出');
       interpretation = '现货与永续各自累计；来自主动成交方向，与盘口挂单及 K 线涨跌颜色无关。';
     } else {
@@ -233,8 +254,10 @@ export class ResearchView {
       interpretation = 'ATR 衡量已发生的日线波动，不是止损建议，也不表示未来最大亏损。';
     }
     this.el('stats').innerHTML = stats;
+    this.renderFocus();
     this.el('interpretation').textContent = interpretation;
-    this.el('pane-labels').innerHTML = labels.map(label => `<span>${label}</span>`).join('');
+    const focusedPanes = this.focusedMetric === 'flow' ? [1, 2] : this.focusedMetric === 'funding' ? [2] : this.focusedMetric ? [1] : [];
+    this.el('pane-labels').innerHTML = labels.map((label, i) => `<span class="${focusedPanes.includes(i) ? 'is-focused' : ''}">${focusedPanes.includes(i) ? '当前关注 · ' : ''}${label}</span>`).join('');
     this.chart.panes().forEach((pane, i) => pane.setStretchFactor(i === 0 ? (this.tab === 'risk' ? 3 : 2.7) : 1));
     this.el('state').hidden = !!last;
     if (!last) {
@@ -314,7 +337,7 @@ export class ResearchView {
 
   private dialog(title: string, content: string) { this.el('dialog-title').textContent = title; this.el('dialog-content').innerHTML = content; this.el<HTMLDialogElement>('dialog').showModal(); }
   private showDetails() {
-    const entries = this.needed().map(([dataset, period]) => {
+    const entries = this.requests().map(([dataset, period]) => {
       const data = this.data(dataset, period);
       if (!data) return `<section><h3>${names[dataset]} · ${periods[period]}</h3><p>${escape(this.errors.get(this.key(dataset, period)) ?? '尚未返回数据')}</p></section>`;
       const first = data.bars[0]?.time ?? data.points[0]?.time ?? data.sourceTime;

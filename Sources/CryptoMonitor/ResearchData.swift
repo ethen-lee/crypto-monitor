@@ -83,6 +83,12 @@ actor ResearchClient {
         stored = (try? JSONDecoder().decode([String: ResearchSeries].self, from: Data(contentsOf: cacheURL))) ?? [:]
     }
 
+    func cachedSeries(_ dataset: ResearchDataset, interval: String) -> ResearchSeries? {
+        guard ["1h", "4h", "1d"].contains(interval) else { return nil }
+        let period = dataset == .funding ? "settlement" : dataset == .reference ? "snapshot" : interval
+        return stored["binance:\(dataset.rawValue):\(dataset.symbol):\(period)"]
+    }
+
     func series(_ dataset: ResearchDataset, interval: String, force: Bool = false) async throws -> ResearchSeries {
         guard ["1h", "4h", "1d"].contains(interval) else { throw MarketError.unsupportedInterval }
         let period = dataset == .funding ? "settlement" : dataset == .reference ? "snapshot" : interval
