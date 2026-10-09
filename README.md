@@ -1,0 +1,90 @@
+# Crypto Monitor
+
+一个常驻 macOS 菜单栏的个人行情工具。点击菜单栏价格，打开可交互的交易图表。
+
+## 启动
+
+本次构建的应用位于 `build/CryptoMonitor.app`，可以直接双击打开，或拖到「应用程序」。首次启动默认在菜单栏展示 BTC、ETH，不显示 Dock 图标。
+
+```sh
+npm ci
+npm run build
+npm start
+```
+
+需要 macOS 13+、Apple Command Line Tools（`xcode-select --install`）及 Node.js 22.12+。构建生成当前机器架构的应用，使用本地 ad-hoc 签名；尚未做 Developer ID 签名及公证，不作为面向其他机器分发的安装包。
+
+## 使用
+
+- 点击菜单栏价格打开/关闭面板，右键可刷新或退出。
+- 顶部切换 BTC、ETH、10 年美债、30 年美债、黄金期货；快捷键 `1`–`5`。
+- 图表默认 K 线，支持拖动、触控板/滚轮缩放；工具栏可切换面积图、MA20/MA50、周期，重置视图。BTC、ETH、黄金支持 1 分钟线。
+- 悬停 K 线时显示详情浮窗，包含时间、开盘价、最高价、最低价、收盘价、本根涨跌和成交量；点击固定，再点同一根或按 `Esc` 取消。切换品种/周期会清除固定。
+- 弹窗目标高度为 900 pt，随所在屏幕的可用空间收缩，额外高度主要分配给价格图。
+- 底部 TradingView 链接与图表内 TV 标志均打开当前品种及周期：Coinbase BTC/USD、ETH/USD、TVC US10Y/US30Y 收益率、COMEX GC1! 黄金连续期货。外站收益率数据源与应用内的 Cboe 指数可能略有差异。
+- 成交量为独立可调整高度的图表区域。美债收益率不提供成交量。
+- 图钉可以保持弹窗打开；`Esc` 先取消已固定的 K 线详情，再按关闭弹窗；`R` 刷新。
+- 设置中选择菜单栏品种，立即保存；“登录时启动”开关可开启或关闭 macOS 登录自启动。
+- 行情页时间按本机时区显示；ETH 观察页与观察日期统一使用 UTC。收益率变动 `1 bp = 0.01` 个百分点。
+
+## ETH 合约观察
+
+选择 ETH，点击图表工具栏的「ETH 合约观察」，进入同一菜单栏弹窗内的二级页面。左上角「返回行情」回到原来的价格图；`Esc` 先取消固定详情，再返回行情，再关闭弹窗。观察日期、周期与页签会记住，图钉和设置在两页均可使用。合约观察不再创建独立应用窗口。
+
+观察页使用 Binance 公共行情作为市场参考，适合几天到几周的持仓观察，不连接交易账户，不输出买卖信号。菜单栏继续使用 Coinbase USD 现货；观察页主图是 **Binance ETHUSDT USDⓈ-M 永续的成交 K 线**，标记价与指数价另列。
+
+- **趋势与强弱**：ETH/BTC 直接现货交易对；同一起点的 ETHUSDT / BTCUSDT 现货涨幅。图上分别显示比率与联动涨幅副图。
+- **杠杆与费率**：OI 数量（ETH）与较上一统计期的变化；逐次实际结算费率、7/30 天已返回记录的合计。8h 等效值为 7 天实际合计除以 21，下一期未结算参考费率单独展示。OI 上升不等于多头净增加。
+- **主动成交**：现货、永续分别展示 CVD，或主动买量 / 卖量；同时显示买入占比和买卖比。来自 K 线接口真实 `takerBuyBaseVolume`，不是 OHLC 涨跌分色。卖量 = 总量 − 主动买量，CVD = 累计买量 − 累计卖量；数量单位为 ETH。
+- **波动风险**：日线 Wilder ATR14、ATR/收盘价，以及较上一日的变化。
+- **资金费情景**：单独弹窗，以最近 24h 实际费率合计每日重复、固定名义本金计算未来 7/30 天的假设金额。它不是未来预测或你的实际账单；数据过期、覆盖不足时不计算。
+- **三类分布**：目前仍是带说明的 CoinGlass、Hyblock、Glassnode 外部入口，尚未完成本地图表。CoinGlass 清算热力图链接已指定 ETH；其他入口需自行选择品种与指标。CoinGlass 热力图 API 需要 Professional / Enterprise 权限，网页会员不等于 API 权限；未取得授权数据前不生成替代图或抓取受限内容。
+
+观察起点默认 **近 30 天**，可切到近 7 天或手动日期。滚动预设每天按 UTC 日期移动；手动日期固定保存在本机，重启继续使用。日期取该日 00:00 UTC，切换到滚动预设不会丢失上次手动日期。起点控制显示窗口、现货相对涨幅和 CVD；7/30 天资金费统计始终是独立的滚动窗口，不受本轮日期影响。缩放和平移不改变统计起点。
+
+观察页提供 1h / 4h / 日线，初次价格历史目标为约 60 天 / 180 天 / 730 天。相对涨幅、CVD 与 ATR 只用已收盘数据；实时 K 线仍可显示。历史不足时显示实际起点；CVD 遇到缺口停止累计，空值不补零。起点超出当前周期历史时，可以切换日线查看更长区间。
+
+OI 公共接口仅提供最近约一个月，初次使用约 29 天安全窗口；应用运行时每 5 分钟检查 4h OI 并保留本地样本，其他 OI 周期在查看时积累，最多保留 2 年。资金费初次回补 90 天并逐步保留本地记录。退出应用或休眠时不采集；恢复后按源的可用窗口回补，超出回补窗口的缺口保留并提示。
+
+观察页可见时，价格与标记价/指数价约每 60 秒检查，OI、资金费与仅用于 ATR 的日线约每 5 分钟检查。手动刷新也遵守限流退避。请求按数据集去重，最多 3 个并发网络请求；429/418 尊重 `Retry-After` 并退避，403/451 暂停该主机请求，不更换地区地址绕过限制。失败显示原始缓存时间，数据源长时间不更新也标为过期。
+
+独立缓存为 `~/Library/Application Support/CryptoMonitor/research-cache-v1.json`；保留平台、市场、交易对、周期、单位、报告/计算属性、源时间及获取时间。详情入口展示当前视图所用数据的覆盖范围。公共接口不需要 API key；可用性受平台条款、地区与接口调整影响，不承诺永久免费或始终可用。[Binance 现货接口](https://developers.binance.com/en/docs/catalog/core-trading-spot-trading/api/rest-api/market)、[永续市场数据接口](https://developers.binance.com/en/docs/catalog/core-trading-derivatives-trading-usd-s-m-futures/api/rest-api/market-data)。
+
+## 行情口径
+
+| 品种 | 来源 | 价格/变动 |
+| --- | --- | --- |
+| BTC、ETH | Coinbase Exchange 公共接口 | USD 现货；滚动 24h 变动 |
+| 10 年、30 年美债 | Yahoo Finance `^TNX` / `^TYX` | Cboe 收益率指数（%）；较昨收变动（bp） |
+| 黄金 | Yahoo Finance `GC=F` | COMEX 连续期货（美元/金衡盎司）；较昨收变动 |
+
+美债指数和黄金展示延时报价，不保证实时。黄金是期货，不是现货金；连续合约换月可能出现价格跳跃。Yahoo 接口为非正式公共接口，可能限流或变更。
+
+菜单栏每 30 秒检查更新，宏观品种最短间隔约 60 秒；弹窗打开时，1 分钟图每约 15 秒检查更新，其他周期每约 60 秒刷新。分钟周期不改变黄金的延迟行情口径。报价时间来自行情源，与本地获取时间分开。失败保留缓存并显示提示，不会生成随机行情。历史窗口有限：BTC/ETH 约 300 根基础 K 线（1 分钟线约 5 小时），周线由约 300 天聚合；宏观品种日线 2 年、周线 5 年，黄金 1 分钟线和 15 分钟线取最近 5 天。没有自动向左翻页加载。
+
+本地缓存：`~/Library/Application Support/CryptoMonitor/market-cache.json`。菜单栏偏好通过 macOS UserDefaults 保存；图表偏好存于 WKWebView localStorage。应用无需 API key，不收集分析数据。
+
+## 登录时启动
+
+在应用设置中打开“登录时启动”。登录 macOS 后应用常驻菜单栏，不自动弹出行情面板；手动打开应用仍会展示面板。首次安装不会自动开启这个选项。
+
+使用 macOS 13+ 原生 `SMAppService.mainApp`，开关状态读取系统的真实登录项状态，不用本地布尔值冒充成功。若显示“等待系统允许”，点击“打开系统登录项”，在 macOS 中允许 Crypto Monitor；从系统设置返回时会同步状态。关闭开关会注销登录项，当前应用继续运行。
+
+建议先将 `CryptoMonitor.app` 放到「应用程序」等稳定位置，从该位置打开后再开启自启动，避免清理构建目录后无法启动。注册失败会显示系统错误，不自动改用 LaunchAgent 或重复注册被用户禁用的项目。
+
+## 结构
+
+- `Sources/CryptoMonitor/`：AppKit 菜单栏、弹窗、WebKit 桥接、原生登录项管理、行情客户端及缓存。
+- `web/`：TypeScript 界面与 TradingView Lightweight Charts 5。
+- `scripts/build-macos.sh`：打包、资源复制和本地签名。
+- `docs/design.md`：视觉设计、数据定义和范围。
+
+`npm run typecheck` 检查前端类型；`npm run build` 同时完成前端和 Swift 编译。不包含自动化测试套件。
+
+TradingView 的开源 Lightweight Charts 是绘图库，本项目自行接入数据；它不是完整的 TradingView 交易终端，不含下单、画线工具或 Pine Script。[第三方声明](THIRD_PARTY_NOTICES.md)。
+
+## 本次安装的设计 skill
+
+`anthropics/skills` 的 [`frontend-design`](https://github.com/anthropics/skills/tree/main/skills/frontend-design)，固定到提交 `683bc88e56f3e09ba94f7055977f3d3aa499f202`。
+
+安装位置：`~/.codex/skills/frontend-design`，并通过 `~/.agents/skills/frontend-design` 软链接发现。2026-10-08 查询时所在仓库为 180,069 Star，比较的 UI UX Pro Max 为 133,870、Taste Skill 为 93,547、Impeccable 为 78,291。Star 是仓库级指标，不是 skill 独立评分。

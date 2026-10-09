@@ -1,0 +1,20 @@
+{
+  "name": "crypto-monitor",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "typecheck": "tsc --noEmit",
+    "build:web": "npm run typecheck && vite build && node scripts/pack-web.mjs",
+    "build": "npm run build:web && bash scripts/build-macos.sh",
+    "start": "open build/CryptoMonitor.app"
+  },
+  "dependencies": {
+    "lightweight-charts": "5.2.1"
+  },
+  "devDependencies": {
+    "typescript": "~5.9.3",
+    "vite": "^7.1.0"
+  }
+}
