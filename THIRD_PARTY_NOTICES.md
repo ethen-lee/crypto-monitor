@@ -7,6 +7,6 @@ Lightweight Charts 5.2.1 is distributed under Apache License 2.0. Its license is
 included in the built application's Resources/LightweightCharts-LICENSE.txt.
 The application includes the TradingView attribution logo and link.
 
-Market data is requested from Coinbase Exchange and Yahoo Finance. These
+Market data is requested from Coinbase Exchange, Yahoo Finance, and Binance. These
 providers do not sponsor or endorse this application. Data rights remain with
 their respective providers.

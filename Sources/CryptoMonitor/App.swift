@@ -35,16 +35,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
     private var observing = false
     private var latest = Snapshot(quotes: [], errors: [:])
     private var preferences: Preferences
+    private var assets: [Asset]
     private var timer: Timer?
     private var escapeMonitor: Any?
     private var refreshing = false
+    private var refreshAgain = false
     private var pageReady = false
     private var chartAsset: Asset = .btc
     private var chartInterval = "1h"
 
     override init() {
-        let assets = UserDefaults.standard.stringArray(forKey: "menuAssets") ?? ["btc", "eth"]
-        preferences = Preferences(menuAssets: assets.filter { Asset(rawValue: $0) != nil }, pinned: false)
+        let saved = UserDefaults.standard.data(forKey: "customAssets.v1")
+            .flatMap { try? JSONDecoder().decode([Asset].self, from: $0) } ?? []
+        var restored = Asset.defaults
+        for item in saved where item.isBinance {
+            guard let asset = Asset.perpetual(symbol: item.symbol, baseAsset: item.baseAsset, tickSize: item.tickSize),
+                  !restored.contains(where: { $0.id == asset.id }) else { continue }
+            restored.append(asset)
+        }
+        assets = restored
+        let menuAssets = UserDefaults.standard.stringArray(forKey: "menuAssets") ?? ["btc", "eth"]
+        preferences = Preferences(menuAssets: menuAssets.filter { id in restored.contains(where: { $0.id == id }) }, pinned: false)
         if preferences.menuAssets.isEmpty { preferences.menuAssets = ["btc", "eth"] }
         super.init()
     }
@@ -81,7 +92,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
             return nil
         }
         Task {
-            latest = await client.cachedSnapshot()
+            latest = await client.cachedSnapshot(assets: assets)
             updateMenuBar()
             await refreshQuotes()
         }
@@ -236,28 +247,47 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
     }
 
     private func refreshQuotes(force: Bool = false) async {
-        guard !refreshing else { return }
+        guard !refreshing else { refreshAgain = true; return }
         refreshing = true
-        defer { refreshing = false }
-        latest = await client.snapshot(force: force)
+        defer {
+            refreshing = false
+            if refreshAgain {
+                refreshAgain = false
+                Task { await refreshQuotes(force: true) }
+            }
+        }
+        let result = await client.snapshot(assets: assets, force: force)
+        let active = Set(assets.map(\.id))
+        latest = Snapshot(quotes: result.quotes.filter { active.contains($0.asset) }, errors: result.errors.filter { active.contains($0.key) })
         updateMenuBar()
         send(["type": "quotes", "payload": jsonObject(latest)])
     }
 
     private func updateMenuBar() {
         let parts = preferences.menuAssets.compactMap { raw -> String? in
-            guard let asset = Asset(rawValue: raw) else { return nil }
-            guard let quote = latest.quotes.first(where: { $0.asset == asset }) else { return "\(asset.label) —" }
+            guard let asset = assets.first(where: { $0.id == raw }) else { return nil }
+            guard let quote = latest.quotes.first(where: { $0.asset == asset.id }) else { return "\(asset.label) —" }
             let formatter = NumberFormatter()
             formatter.numberStyle = .decimal
-            formatter.minimumFractionDigits = asset.isYield ? 2 : 0
-            formatter.maximumFractionDigits = asset.isYield ? 2 : 0
+            formatter.minimumFractionDigits = asset.isYield ? 2 : asset.isBinance ? min(2, asset.priceDecimals) : 0
+            formatter.maximumFractionDigits = asset.isYield ? 2 : asset.isBinance ? asset.priceDecimals : 0
             let value = formatter.string(from: NSNumber(value: quote.price)) ?? "—"
             return "\(asset.label) \(value)\(asset.isYield ? "%" : "")\(quote.cached ? " ◦" : "")"
         }
         statusItem.button?.title = " " + parts.joined(separator: "  ·  ")
         statusItem.button?.toolTip = "Crypto Monitor\n点击查看 K 线 · 右键打开菜单\n◦ 表示缓存报价"
         statusItem.button?.setAccessibilityLabel("Crypto Monitor，" + parts.joined(separator: "，"))
+    }
+
+    private func watchlistPayload() -> [String: Any] {
+        ["assets": jsonObject(assets), "preferences": jsonObject(preferences), "snapshot": jsonObject(latest),
+         "tradingViewSymbols": Dictionary(uniqueKeysWithValues: assets.map { ($0.id, $0.tradingViewSymbol) })]
+    }
+
+    private func persistWatchlist() throws {
+        let data = try JSONEncoder().encode(assets.filter(\.isCustom))
+        UserDefaults.standard.set(data, forKey: "customAssets.v1")
+        UserDefaults.standard.set(preferences.menuAssets, forKey: "menuAssets")
     }
 
     func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
@@ -269,8 +299,55 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
             NSLog("Frontend error: %@", String((body["message"] as? String ?? "Unknown error").prefix(500)))
         case "ready":
             pageReady = true
-            let symbols = Dictionary(uniqueKeysWithValues: Asset.allCases.map { ($0.rawValue, $0.tradingViewSymbol) })
-            reply(id, payload: ["snapshot": jsonObject(latest), "preferences": jsonObject(preferences), "visible": popover.isShown, "tradingViewSymbols": symbols, "loginItem": jsonObject(loginItemState())])
+            var payload = watchlistPayload()
+            payload["visible"] = popover.isShown
+            payload["loginItem"] = jsonObject(loginItemState())
+            reply(id, payload: payload)
+        case "assetCatalog":
+            let force = body["force"] as? Bool ?? false
+            Task {
+                do { reply(id, payload: jsonObject(try await client.perpetualCatalog(force: force))) }
+                catch { reply(id, error: error.localizedDescription) }
+            }
+        case "addAsset":
+            guard let symbol = body["symbol"] as? String else { reply(id, error: "请选择要添加的合约。"); return }
+            Task {
+                do {
+                    let catalog = try await client.perpetualCatalog()
+                    guard let asset = catalog.first(where: { $0.symbol == symbol }) else {
+                        reply(id, error: "未找到可交易的 Binance USDT 永续合约，请刷新列表后重试。")
+                        return
+                    }
+                    if !assets.contains(where: { $0.id == asset.id }) {
+                        let previousPreferences = preferences
+                        assets.append(asset)
+                        preferences.menuAssets.append(asset.id)
+                        do { try persistWatchlist() }
+                        catch { assets.removeAll { $0.id == asset.id }; preferences = previousPreferences; throw error }
+                        updateMenuBar()
+                    }
+                    reply(id, payload: watchlistPayload())
+                    await refreshQuotes()
+                } catch { reply(id, error: error.localizedDescription) }
+            }
+        case "removeAsset":
+            guard let assetID = body["asset"] as? String,
+                  let asset = assets.first(where: { $0.id == assetID }), asset.isCustom else {
+                reply(id, error: "只能移除手动添加的资产。")
+                return
+            }
+            let previousAssets = assets, previousPreferences = preferences
+            assets.removeAll { $0.id == assetID }
+            preferences.menuAssets.removeAll { $0 == assetID }
+            if preferences.menuAssets.isEmpty { preferences.menuAssets = ["btc"] }
+            do { try persistWatchlist() }
+            catch { assets = previousAssets; preferences = previousPreferences; reply(id, error: error.localizedDescription); return }
+            latest = Snapshot(quotes: latest.quotes.filter { $0.asset != assetID }, errors: latest.errors.filter { $0.key != assetID })
+            if chartAsset.id == assetID {
+                chartAsset = assets.first(where: { preferences.menuAssets.contains($0.id) }) ?? .btc
+            }
+            updateMenuBar()
+            reply(id, payload: watchlistPayload())
         case "loginItemStatus":
             reply(id, payload: jsonObject(loginItemState()))
         case "setLaunchAtLogin":
@@ -321,7 +398,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
             }
             reply(id, payload: NSWorkspace.shared.open(url))
         case "history":
-            guard let raw = body["asset"] as? String, let asset = Asset(rawValue: raw), let interval = body["interval"] as? String else {
+            guard let raw = body["asset"] as? String, let asset = assets.first(where: { $0.id == raw }), let interval = body["interval"] as? String else {
                 reply(id, error: "无效的行情请求。")
                 return
             }
@@ -333,8 +410,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
                 catch { reply(id, error: error.localizedDescription) }
             }
         case "preferences":
-            if let assets = body["menuAssets"] as? [String] {
-                let valid = Asset.allCases.map(\.rawValue).filter { assets.contains($0) }
+            if let requested = body["menuAssets"] as? [String] {
+                let valid = assets.map(\.id).filter { requested.contains($0) }
                 if !valid.isEmpty {
                     preferences.menuAssets = valid
                     UserDefaults.standard.set(valid, forKey: "menuAssets")

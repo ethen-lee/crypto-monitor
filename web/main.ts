@@ -9,7 +9,7 @@ import { MarketSummary } from './market-summary';
 import type { SummaryID } from './research-model';
 import './research.css';
 
-type AssetID = 'btc' | 'eth' | 'us10y' | 'us30y' | 'gold';
+type AssetID = string;
 type Interval = '1m' | '15m' | '1h' | '6h' | '1d' | '1w';
 const intervalLabels: Record<Interval, string> = { '1m': '1 分', '15m': '15 分', '1h': '1 小时', '6h': '6 小时', '1d': '日线', '1w': '周线' };
 const tradingViewIntervals: Record<Interval, string> = { '1m': '1', '15m': '15', '1h': '60', '6h': '360', '1d': 'D', '1w': 'W' };
@@ -22,7 +22,9 @@ interface History { asset: AssetID; interval: Interval; candles: Candle[]; fetch
 interface Snapshot { quotes: Quote[]; errors: Record<string, string> }
 interface Preferences { menuAssets: AssetID[]; pinned: boolean }
 interface LoginItemState { status: 'enabled' | 'notRegistered' | 'requiresApproval' | 'notFound' | 'unavailable'; error?: string }
-interface Asset { id: AssetID; name: string; short: string; symbol: string; detail: string; kind: 'crypto' | 'yield' | 'gold'; color: string; icon: string }
+interface NativeAsset { id: AssetID; name: string; symbol: string; baseAsset: string; provider: 'coinbase' | 'yahoo' | 'binance'; tickSize: number }
+interface Asset extends NativeAsset { detail: string; kind: 'crypto' | 'yield' | 'gold'; color: string; icon: string; priceUnit: string; priceDecimals: number; removable: boolean }
+interface WatchlistState { assets: NativeAsset[]; snapshot: Snapshot; preferences: Preferences; tradingViewSymbols: Record<AssetID, string> }
 
 const icons: Record<string, string> = {
   pulse: '<path d="M2 12h4l3-7 5 14 3-7h5"/>',
@@ -40,23 +42,31 @@ const icons: Record<string, string> = {
   arrow: '<path d="m7 17 10-10M7 7h10v10"/>',
 };
 const svg = (name: string, size = 18) => `<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${icons[name] || ''}</svg>`;
-const assets: Asset[] = [
-  { id: 'btc', name: '比特币', short: 'Bitcoin', symbol: 'BTC / USD', detail: 'Coinbase 现货', kind: 'crypto', color: '#f1ba70', icon: '₿' },
-  { id: 'eth', name: '以太坊', short: 'Ethereum', symbol: 'ETH / USD', detail: 'Coinbase 现货', kind: 'crypto', color: '#a5b5ff', icon: 'eth' },
-  { id: 'us10y', name: '10 年期美债', short: '美国国债', symbol: 'US 10Y', detail: 'Cboe 收益率指数', kind: 'yield', color: '#80bafa', icon: 'bond' },
-  { id: 'us30y', name: '30 年期美债', short: '美国国债', symbol: 'US 30Y', detail: 'Cboe 收益率指数', kind: 'yield', color: '#90cacf', icon: 'bond' },
-  { id: 'gold', name: '黄金期货', short: 'COMEX', symbol: 'GOLD', detail: 'COMEX 黄金连续期货', kind: 'gold', color: '#dec690', icon: 'gold' },
-];
+let assets: Asset[] = [];
+function describeAsset(value: NativeAsset): Asset {
+  const isYield = value.provider === 'yahoo';
+  const isPerpetual = value.provider === 'binance';
+  const colors: Record<string, string> = { btc: '#f1ba70', eth: '#a5b5ff', us10y: '#80bafa', us30y: '#90cacf', gold: '#dec690' };
+  return { ...value,
+    symbol: isYield ? `US ${value.baseAsset}` : isPerpetual ? value.symbol : `${value.baseAsset} / USD`,
+    detail: isYield ? 'Cboe 收益率指数' : isPerpetual ? 'Binance USDT 永续 · 最新成交价' : 'Coinbase 现货',
+    kind: isYield ? 'yield' : value.id === 'gold' ? 'gold' : 'crypto',
+    color: colors[value.id] ?? '#65d6bd',
+    icon: value.id === 'btc' ? '₿' : value.id === 'eth' ? 'eth' : value.id === 'gold' ? 'gold' : isYield ? 'bond' : 'pulse',
+    priceUnit: isYield ? '%' : isPerpetual ? 'USDT' : 'USD',
+    priceDecimals: value.tickSize.toFixed(12).replace(/0+$/, '').split('.')[1]?.length ?? 0,
+    removable: value.id.startsWith('binance:perpetual:'),
+  };
+}
 const read = <T>(key: string, fallback: T): T => {
   try { const value = localStorage.getItem(key); return value ? JSON.parse(value) : fallback; } catch { return fallback; }
 };
 const persist = (key: string, value: unknown) => { try { localStorage.setItem(key, JSON.stringify(value)); } catch { /* Storage is optional. */ } };
 const savedAsset = read<AssetID>('asset', 'btc');
 let page: 'market' | 'research' = 'market';
-let selected: AssetID = assets.some(a => a.id === savedAsset) ? savedAsset : 'btc';
+let selected: AssetID = savedAsset;
 let interval: Interval = read<Interval>('interval', '1h');
 if (!(interval in intervalLabels)) interval = '1h';
-if (assets.find(a => a.id === selected)?.kind === 'yield' && !['1d', '1w'].includes(interval)) interval = '1d';
 let snapshot: Snapshot = { quotes: [], errors: {} };
 let preferences: Preferences = { menuAssets: ['btc', 'eth'], pinned: false };
 let loginItem: LoginItemState | undefined;
@@ -79,13 +89,15 @@ let historyError: string | undefined;
 let bridgeReady = false;
 const observing = () => page === 'research';
 const asset = () => assets.find(a => a.id === selected)!;
+const visibleAssets = () => assets.filter(a => preferences.menuAssets.includes(a.id));
 const quote = () => snapshot.quotes.find(q => q.asset === selected);
 const byId = <T extends HTMLElement = HTMLElement>(id: string) => document.getElementById(id) as T;
-const fmt = (value: number | undefined, yieldValue = false) => value == null || !Number.isFinite(value) ? '—' : value.toLocaleString('en-US', { minimumFractionDigits: yieldValue ? 3 : 2, maximumFractionDigits: yieldValue ? 3 : 2 });
+const fmt = (value: number | undefined, a = asset()) => value == null || !Number.isFinite(value) ? '—' : value.toLocaleString('en-US', { minimumFractionDigits: a.priceDecimals, maximumFractionDigits: a.priceDecimals });
 const signed = (value: number, digits = 2) => `${value >= 0 ? '+' : '−'}${Math.abs(value).toFixed(digits)}`;
 const dateFmt = (seconds: number, full = false) => new Intl.DateTimeFormat('zh-CN', { month: '2-digit', day: '2-digit', ...(full ? { hour: '2-digit', minute: '2-digit', hour12: false } : {}) }).format(new Date(seconds * 1000));
 const historyDate = (seconds: number) => new Intl.DateTimeFormat('zh-CN', { year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date(seconds * 1000));
-const iconFor = (a: Asset) => `<span class="asset-icon ${a.id}">${a.id === 'btc' ? '₿' : svg(a.icon, 21)}</span>`;
+const escapeHTML = (value: string) => value.replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]!));
+const iconFor = (a: Asset) => `<span class="asset-icon ${a.removable ? 'custom' : a.id}">${a.id === 'btc' ? '₿' : svg(a.icon, 21)}</span>`;
 const changeText = (q: Quote | undefined, a: Asset) => !q || q.change == null ? '—' : a.kind === 'yield' ? `${signed(q.change * 100, 1)} bp` : q.changePercent == null ? '—' : `${signed(q.changePercent)}%`;
 const direction = (q: Quote | undefined) => q?.change == null ? '' : q.change >= 0 ? 'positive' : 'negative';
 
@@ -141,11 +153,7 @@ byId('app').innerHTML = `
         <button id="close" class="icon-button" aria-label="关闭弹窗" title="关闭（Esc）">${svg('close')}</button>
       </div>
     </header>
-    <nav class="watchlist" aria-label="自选行情">${assets.map(a => `
-      <button class="watch-item" data-asset="${a.id}" aria-label="查看${a.name}" aria-pressed="${a.id === selected}">
-        <span class="watch-title">${iconFor(a)}<span>${a.kind === 'yield' ? a.symbol : a.name}</span><span class="watch-tag">${a.kind === 'yield' ? '收益率' : a.id === 'gold' ? '期货' : a.id.toUpperCase()}</span></span>
-        <span class="watch-values"><strong id="watch-price-${a.id}">—</strong><span id="watch-change-${a.id}" class="watch-change">—</span></span>
-      </button>`).join('')}</nav>
+    <div class="watchlist-bar"><nav id="watchlist" class="watchlist" aria-label="自选行情"></nav><button id="assets-open" class="watch-add" title="添加自选资产" aria-label="添加自选资产"><span>＋</span>添加</button></div>
     <main id="market-workspace" class="workspace">
       <section class="instrument" aria-label="当前行情">
         <div class="instrument-primary"><div class="instrument-title"><h1 id="asset-name"></h1><span id="asset-symbol"></span><span class="session-badge" id="session"></span></div>
@@ -177,15 +185,21 @@ byId('app').innerHTML = `
     <main id="research-workspace" class="workspace research-workspace" hidden></main>
     <footer class="app-footer"><div class="source"><span id="source-dot" class="source-dot"></span><span id="source-name"></span><span id="quote-time"></span></div><div class="footer-actions"><button id="refresh" class="refresh-button" title="刷新行情（R）">${svg('refresh', 13)}刷新</button><a id="tradingview-link" title="在 TradingView 查看当前品种">TradingView ${svg('arrow', 11)}</a></div></footer>
   </div>
-  <dialog id="settings" aria-labelledby="settings-title"><div class="dialog-heading"><div><h2 id="settings-title">让行情，留在视线里</h2><p>选择 macOS 菜单栏显示的品种</p></div><button id="settings-close" class="icon-button" aria-label="关闭设置">${svg('close')}</button></div>
-    <div class="settings-assets">${assets.map(a => `<label class="setting-row">${iconFor(a)}<span><strong>${a.name}</strong><small>${a.symbol}</small></span><input type="checkbox" value="${a.id}" name="menu-asset" /></label>`).join('')}</div>
-    <p id="settings-feedback" class="settings-feedback" role="status">至少保留一个品种。选得越少，菜单栏越简洁。</p>
+  <dialog id="settings" aria-labelledby="settings-title"><div class="dialog-heading"><div><h2 id="settings-title">让行情，留在视线里</h2><p>选择主页和 macOS 菜单栏显示的品种</p></div><button id="settings-close" class="icon-button" aria-label="关闭设置">${svg('close')}</button></div>
+    <section class="asset-search" aria-label="添加资产"><label for="asset-query">添加 Binance USDT 永续</label>
+      <form id="asset-search-form"><input id="asset-query" type="search" placeholder="搜索 HYPE、SOL 或完整交易对" autocomplete="off" spellcheck="false" /><button id="catalog-refresh" type="button" title="刷新可用合约">${svg('refresh', 15)}</button></form>
+      <p id="asset-search-status" class="asset-search-status" role="status">从币安当前可交易的 USDT 永续合约中选择。</p>
+      <div id="asset-search-results" class="asset-search-results"></div>
+    </section>
+    <div class="settings-list-heading"><strong>我的自选</strong><span>主页与菜单栏</span></div>
+    <div id="settings-assets" class="settings-assets"></div>
+    <p id="settings-feedback" class="settings-feedback" role="status">至少保留一个品种。取消勾选后隐藏，仍可在这里重新开启。</p>
     <section class="startup-setting" aria-label="启动设置">
       <label class="startup-row" for="launch-at-login"><span><strong>登录时启动</strong><small>登录 macOS 后，自动显示菜单栏行情</small></span><input id="launch-at-login" type="checkbox" role="switch" aria-describedby="startup-status" disabled /></label>
       <p id="startup-status" class="startup-status" role="status">正在读取系统登录项…</p>
       <button id="login-system-settings" class="system-settings-button" hidden>打开系统登录项 ${svg('arrow', 12)}</button>
     </section>
-    <div class="settings-info"><strong>关于行情</strong><p>菜单栏 BTC / ETH 为 Coinbase 美元现货，涨跌为滚动 24h。美债为收益率指数，变动单位为 bp；黄金为 COMEX 连续期货，均显示延时报价。</p><p>每 30 秒检查更新。网络异常时显示缓存和原始报价时间。行情页按本机时区；ETH 观察页使用 Binance 市场参考与 UTC 时间，独立显示数据来源。</p><p>TradingView Lightweight Charts™<br>Copyright (с) 2025 TradingView, Inc.</p></div>
+    <div class="settings-info"><strong>关于行情</strong><p>默认 BTC / ETH 为 Coinbase 美元现货。黄金及手动添加的资产为 Binance USDT 永续，展示最新成交价与滚动 24h 涨跌。美债为延时收益率指数，变动单位为 bp。</p><p>每 30 秒检查更新。网络异常时显示同一品种的缓存和原始报价时间。行情页按本机时区；ETH 观察页使用 Binance 市场参考与 UTC 时间，独立显示数据来源。</p><p>TradingView Lightweight Charts™<br>Copyright (с) 2025 TradingView, Inc.</p></div>
     <div class="dialog-footer"><span>Crypto Monitor <small>0.1.0</small></span><button id="quit" class="text-button">退出应用</button></div>
   </dialog>`;
 
@@ -260,15 +274,16 @@ function returnToMarket() {
 byId('research-back').addEventListener('click', returnToMarket);
 
 function renderSelection() {
+  if (!assets.length) return;
   const a = asset();
   byId('asset-name').textContent = a.name;
   byId('asset-symbol').textContent = a.symbol;
-  byId('chart-watermark').textContent = a.kind === 'crypto' ? a.id.toUpperCase() : a.kind === 'yield' ? a.symbol : 'GOLD';
-  byId('price-unit').textContent = a.kind === 'yield' ? '%' : 'USD';
-  byId('session').textContent = a.kind === 'crypto' ? '24 / 7' : '延时报价';
-  byId('range-label').textContent = a.kind === 'crypto' ? '24h 区间' : '当日区间';
-  byId('range-unit').textContent = a.kind === 'yield' ? '%' : 'USD';
-  byId('source-name').textContent = a.kind === 'crypto' ? 'Coinbase' : 'Yahoo Finance';
+  byId('chart-watermark').textContent = a.baseAsset;
+  byId('price-unit').textContent = a.priceUnit;
+  byId('session').textContent = a.kind === 'yield' ? '延时报价' : a.provider === 'binance' ? '永续 · 24 / 7' : '现货 · 24 / 7';
+  byId('range-label').textContent = a.kind === 'yield' ? '当日区间' : '24h 区间';
+  byId('range-unit').textContent = a.priceUnit;
+  byId('source-name').textContent = a.provider === 'binance' ? 'Binance Futures' : a.provider === 'coinbase' ? 'Coinbase' : 'Yahoo Finance';
   const tradingViewLink = byId<HTMLAnchorElement>('tradingview-link');
   const symbol = tradingViewSymbols[selected];
   if (symbol) {
@@ -285,7 +300,7 @@ function renderSelection() {
     button.disabled = a.kind === 'yield' && !['1d', '1w'].includes(button.dataset.interval!);
     button.title = button.disabled ? '美债收益率提供日线和周线' : '';
   }
-  const priceFormat = { type: 'custom' as const, minMove: a.kind === 'yield' ? 0.001 : 0.01, formatter: (value: number) => fmt(value, a.kind === 'yield') + (a.kind === 'yield' ? '%' : '') };
+  const priceFormat = { type: 'custom' as const, minMove: a.tickSize, formatter: (value: number) => fmt(value, a) + (a.kind === 'yield' ? '%' : '') };
   [candles, area, ma20, ma50].forEach(series => series.applyOptions({ priceFormat }));
   chart.applyOptions({ timeScale: { timeVisible: !['1d', '1w'].includes(interval) } });
   renderQuotes();
@@ -294,9 +309,11 @@ function renderSelection() {
 }
 
 function renderQuotes() {
-  for (const a of assets) {
+  if (!assets.length) return;
+  const displayed = visibleAssets();
+  for (const a of displayed) {
     const q = snapshot.quotes.find(q => q.asset === a.id);
-    byId(`watch-price-${a.id}`).textContent = q ? fmt(q.price, a.kind === 'yield') + (a.kind === 'yield' ? '%' : '') : '—';
+    byId(`watch-price-${a.id}`).textContent = q ? fmt(q.price, a) + (a.kind === 'yield' ? '%' : '') : '—';
     const change = byId(`watch-change-${a.id}`);
     change.textContent = q?.cached ? '缓存' : changeText(q, a);
     change.className = `watch-change ${q?.cached ? 'cached' : direction(q)}`;
@@ -304,17 +321,18 @@ function renderQuotes() {
     button.title = snapshot.errors[a.id] ?? (q ? `报价时间 ${dateFmt(q.timestamp, true)}` : '等待行情');
   }
   const a = asset(), q = quote();
-  byId('price').textContent = fmt(q?.price, a.kind === 'yield');
+  byId('price').textContent = fmt(q?.price, a);
   const change = byId('change');
   change.className = `price-change ${direction(q)}`;
   change.textContent = changeText(q, a);
-  byId('price-caption').textContent = `${a.detail}${a.kind === 'gold' ? ' · 美元 / 金衡盎司' : ''}　${a.kind === 'crypto' ? '较 24 小时前' : '较上一交易日收盘'}`;
-  byId('day-low').textContent = fmt(q?.low, a.kind === 'yield');
-  byId('day-high').textContent = fmt(q?.high, a.kind === 'yield');
+  byId('price-caption').textContent = `${a.detail}　${a.kind === 'yield' ? '较上一交易日收盘' : '滚动 24h 涨跌'}`;
+  byId('day-low').textContent = fmt(q?.low, a);
+  byId('day-high').textContent = fmt(q?.high, a);
   const fraction = q && q.high != null && q.low != null && q.high > q.low ? (q.price - q.low) / (q.high - q.low) : 0.5;
   byId('range-marker').style.left = `${Math.max(0, Math.min(1, fraction)) * 100}%`;
-  const stale = snapshot.quotes.some(q => q.cached) || Object.keys(snapshot.errors).length > 0;
-  byId('connection').innerHTML = `<i></i>${!snapshot.quotes.length ? '等待行情' : stale ? '部分报价未更新' : '行情已连接'}`;
+  const displayedQuotes = snapshot.quotes.filter(q => preferences.menuAssets.includes(q.asset));
+  const stale = displayedQuotes.some(q => q.cached) || displayed.some(a => !!snapshot.errors[a.id]);
+  byId('connection').innerHTML = `<i></i>${!displayedQuotes.length ? '等待行情' : stale ? '部分报价未更新' : '行情已连接'}`;
   byId('connection').classList.toggle('is-stale', stale);
   if (!observing()) {
     byId('quote-time').textContent = q ? `${q.cached ? '缓存 · ' : ''}${dateFmt(q.timestamp, true)} 报价` : '尚无报价';
@@ -344,6 +362,7 @@ function movingAverage(rows: Candle[], period: number) {
 }
 
 function updateIndicators() {
+  if (!assets.length) return;
   byId('sma20').setAttribute('aria-pressed', String(sma20));
   byId('sma50').setAttribute('aria-pressed', String(sma50));
   for (const [id, period, series, enabled] of [
@@ -365,8 +384,7 @@ function updateIndicators() {
 
 function renderOHLC(candle?: Candle) {
   if (!candle) { byId('ohlc').innerHTML = '<span>将光标移到 K 线上，查看开高低收</span>'; return; }
-  const isYield = asset().kind === 'yield';
-  byId('ohlc').innerHTML = `<time>${dateFmt(candle.time, !['1d', '1w'].includes(interval))}</time>${(['open', 'high', 'low', 'close'] as const).map((key, i) => `<span>${['开', '高', '低', '收'][i]} <b class="${key === 'close' ? candle.close >= candle.open ? 'positive' : 'negative' : ''}">${fmt(candle[key], isYield)}</b></span>`).join('')}<span class="ohlc-volume">${candle.volume != null ? `量 <b>${new Intl.NumberFormat('en-US', { notation: 'compact', maximumFractionDigits: 1 }).format(candle.volume)}</b>` : ''}</span>`;
+  byId('ohlc').innerHTML = `<time>${dateFmt(candle.time, !['1d', '1w'].includes(interval))}</time>${(['open', 'high', 'low', 'close'] as const).map((key, i) => `<span>${['开', '高', '低', '收'][i]} <b class="${key === 'close' ? candle.close >= candle.open ? 'positive' : 'negative' : ''}">${fmt(candle[key])}</b></span>`).join('')}<span class="ohlc-volume">${candle.volume != null ? `量 <b>${new Intl.NumberFormat('en-US', { notation: 'compact', maximumFractionDigits: 1 }).format(candle.volume)}</b>` : ''}</span>`;
 }
 
 function clearInspection() {
@@ -396,12 +414,12 @@ function renderInspection() {
     year: 'numeric', month: '2-digit', day: '2-digit',
     ...(!['1d', '1w'].includes(interval) ? { hour: '2-digit' as const, minute: '2-digit' as const, hour12: false } : {}),
   }).format(new Date(row.time * 1000));
-  const unit = isYield ? '%' : 'USD';
-  tooltip.innerHTML = `<div class="tooltip-heading"><strong>${asset().symbol}</strong><span>${intervalLabels[interval]}</span></div>
+  const unit = asset().priceUnit;
+  tooltip.innerHTML = `<div class="tooltip-heading"><strong>${escapeHTML(asset().symbol)}</strong><span>${intervalLabels[interval]}</span></div>
     <time>${time}</time><dl>${(['open', 'high', 'low', 'close'] as const).map((key, i) =>
-      `<dt>${['开盘价', '最高价', '最低价', '收盘价'][i]}</dt><dd class="${key === 'close' ? up ? 'positive' : 'negative' : ''}">${fmt(row[key], isYield)} <small>${unit}</small></dd>`).join('')}
+      `<dt>${['开盘价', '最高价', '最低价', '收盘价'][i]}</dt><dd class="${key === 'close' ? up ? 'positive' : 'negative' : ''}">${fmt(row[key])} <small>${unit}</small></dd>`).join('')}
       <dt>本根涨跌</dt><dd class="${up ? 'positive' : 'negative'}">${change}</dd>
-      ${row.volume != null ? `<dt>成交量</dt><dd>${new Intl.NumberFormat('en-US', { maximumFractionDigits: 4 }).format(row.volume)} <small>${asset().kind === 'crypto' ? selected.toUpperCase() : '手'}</small></dd>` : ''}</dl>
+      ${row.volume != null ? `<dt>成交量</dt><dd>${new Intl.NumberFormat('en-US', { maximumFractionDigits: 4 }).format(row.volume)} <small>${escapeHTML(asset().baseAsset)}</small></dd>` : ''}</dl>
     <div class="tooltip-hint">${pinnedCandle ? `${svg('pin', 11)} 已固定 · Esc 取消` : '点击固定这根 K 线'}</div>`;
   tooltip.classList.toggle('is-pinned', pinnedCandle);
   tooltip.hidden = false;
@@ -449,7 +467,7 @@ function chartState(message?: string, error = false) {
 }
 
 async function loadHistory(force = false, quiet = false) {
-  if (observing()) return;
+  if (!bridgeReady || !assets.length || observing()) return;
   const request = ++historyRequest;
   lastHistoryRequestAt = Date.now();
   const targetAsset = selected, targetInterval = interval;
@@ -507,16 +525,20 @@ byId('chart').addEventListener('pointerleave', () => {
 });
 
 function selectAsset(id: AssetID) {
-  if (observing()) return;
+  if (observing() || !visibleAssets().some(a => a.id === id)) return;
   if (selected === id) return;
   selected = id;
   if (asset().kind === 'yield' && !['1d', '1w'].includes(interval)) interval = '1d';
   persist('asset', selected);
   persist('interval', interval);
   renderSelection();
+  document.querySelector<HTMLElement>(`[data-asset="${id}"]`)?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
   void loadHistory();
 }
-document.querySelectorAll<HTMLButtonElement>('[data-asset]').forEach(button => button.addEventListener('click', () => selectAsset(button.dataset.asset as AssetID)));
+byId('watchlist').addEventListener('click', event => {
+  const button = (event.target as HTMLElement).closest<HTMLButtonElement>('[data-asset]');
+  if (button?.dataset.asset) selectAsset(button.dataset.asset);
+});
 document.querySelectorAll<HTMLButtonElement>('[data-interval]').forEach(button => button.addEventListener('click', () => {
   if (interval === button.dataset.interval) return;
   interval = button.dataset.interval as Interval;
@@ -560,6 +582,133 @@ byId('pin').addEventListener('click', async () => {
   } catch (error) { historyError = String(error); renderNotice(); }
 });
 const settings = byId<HTMLDialogElement>('settings');
+let catalog: NativeAsset[] = [];
+let catalogLoading = false;
+let catalogError = '';
+let assetMutationBusy = false;
+
+function renderWatchlist() {
+  byId('watchlist').innerHTML = visibleAssets().map(a => `
+    <button class="watch-item" data-asset="${escapeHTML(a.id)}" aria-label="查看${escapeHTML(a.name)} ${escapeHTML(a.symbol)}" aria-pressed="${a.id === selected}">
+      <span class="watch-title">${iconFor(a)}<span>${escapeHTML(a.kind === 'yield' ? a.symbol : a.name)}</span><span class="watch-tag">${a.kind === 'yield' ? '收益率' : a.provider === 'binance' ? '永续' : '现货'}</span></span>
+      <span class="watch-values"><strong id="watch-price-${escapeHTML(a.id)}">—</strong><span id="watch-change-${escapeHTML(a.id)}" class="watch-change">—</span></span>
+    </button>`).join('');
+}
+
+function renderSettingsAssets() {
+  byId('settings-assets').innerHTML = assets.map(a => `<div class="setting-row"><label class="setting-option">${iconFor(a)}<span><strong>${escapeHTML(a.name)}</strong><small>${escapeHTML(a.symbol)} · ${a.provider === 'binance' ? 'Binance 永续' : a.provider === 'coinbase' ? 'Coinbase 现货' : '收益率'}</small></span><input type="checkbox" value="${escapeHTML(a.id)}" name="menu-asset" aria-label="主页和菜单栏显示 ${escapeHTML(a.symbol)}" ${preferences.menuAssets.includes(a.id) ? 'checked' : ''} ${assetMutationBusy ? 'disabled' : ''} /></label>${a.removable ? `<button class="remove-asset" data-remove="${escapeHTML(a.id)}" aria-label="移除 ${escapeHTML(a.symbol)}" ${assetMutationBusy ? 'disabled' : ''}>移除</button>` : '<span class="built-in-asset">内置</span>'}</div>`).join('');
+}
+
+function matchingAssets() {
+  const query = byId<HTMLInputElement>('asset-query').value.trim().toUpperCase().replace(/[\s/]/g, '');
+  return query ? catalog.filter(a => a.symbol.includes(query) || a.baseAsset.includes(query)).sort((a, b) => {
+    const exact = (a: NativeAsset) => a.symbol === query || a.baseAsset === query;
+    return Number(exact(b)) - Number(exact(a)) || a.symbol.localeCompare(b.symbol);
+  }) : [];
+}
+
+function renderAssetResults() {
+  const matches = matchingAssets();
+  const hasQuery = !!byId<HTMLInputElement>('asset-query').value.trim();
+  byId('asset-search-status').textContent = catalogLoading ? '正在读取币安可用合约…' : catalogError || (!catalog.length ? '点击刷新读取可用合约。' : !hasQuery ? `可搜索 ${catalog.length} 个 USDT 永续合约，例如 HYPE。` : !matches.length ? '未找到匹配的可交易合约，请检查名称或刷新列表。' : matches.length > 20 ? `找到 ${matches.length} 个匹配，显示前 20 个；可继续输入筛选。` : `找到 ${matches.length} 个匹配合约。`);
+  byId<HTMLButtonElement>('catalog-refresh').disabled = catalogLoading;
+  byId('asset-search-results').innerHTML = catalogLoading || catalogError ? '' : matches.slice(0, 20).map(item => {
+    const added = assets.some(a => a.id === item.id);
+    return `<div class="asset-result"><span><strong>${escapeHTML(item.baseAsset)}</strong><small>${escapeHTML(item.symbol)} · USDT 永续</small></span><button type="button" data-add="${escapeHTML(item.symbol)}" aria-label="添加 ${escapeHTML(item.symbol)}" ${added || assetMutationBusy ? 'disabled' : ''}>${added ? '已添加' : '添加'}</button></div>`;
+  }).join('');
+}
+
+async function loadCatalog(force = false) {
+  if (catalogLoading) return;
+  catalogLoading = true;
+  catalogError = '';
+  renderAssetResults();
+  try { catalog = await native<NativeAsset[]>('assetCatalog', { force }); }
+  catch (error) { catalogError = error instanceof Error ? error.message : '无法读取合约列表，请重试。'; }
+  finally { catalogLoading = false; renderAssetResults(); }
+}
+
+function applyWatchlist(value: WatchlistState, target?: AssetID) {
+  assets = value.assets.map(describeAsset);
+  snapshot = value.snapshot;
+  preferences = value.preferences;
+  tradingViewSymbols = value.tradingViewSymbols;
+  syncVisibleSelection(target);
+  renderSettingsAssets();
+  renderAssetResults();
+}
+
+function syncVisibleSelection(target?: AssetID) {
+  const displayed = visibleAssets();
+  if (!displayed.length) return false;
+  const previous = selected;
+  selected = target ?? selected;
+  if (!displayed.some(a => a.id === selected)) selected = displayed[0].id;
+  const changed = previous !== selected;
+  if (changed) {
+    page = 'market';
+    historyRequest++;
+    loading = false;
+    history = undefined;
+    historyError = undefined;
+    marketRange = null;
+    returnMetric = undefined;
+    clearChart();
+  }
+  if (asset().kind === 'yield' && !['1d', '1w'].includes(interval)) interval = '1d';
+  persist('asset', selected);
+  persist('interval', interval);
+  renderWatchlist();
+  if (observing()) { renderQuotes(); renderView(); }
+  else renderSelection();
+  document.querySelector<HTMLElement>(`[data-asset="${selected}"]`)?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+  return changed;
+}
+
+async function addAsset(symbol: string) {
+  if (assetMutationBusy) return;
+  assetMutationBusy = true;
+  renderSettingsAssets(); renderAssetResults();
+  byId('settings-feedback').textContent = `正在添加 ${symbol}…`;
+  try {
+    const value = await native<WatchlistState>('addAsset', { symbol });
+    const target = value.assets.find(a => a.provider === 'binance' && a.symbol === symbol);
+    page = 'market';
+    applyWatchlist(value, target?.id);
+    void loadHistory();
+    byId('settings-feedback').textContent = `已添加 ${symbol}，主页和菜单栏均已显示。`;
+  } catch (error) { byId('settings-feedback').textContent = error instanceof Error ? error.message : '添加失败，请重试。'; }
+  finally { assetMutationBusy = false; renderSettingsAssets(); renderAssetResults(); }
+}
+
+byId('asset-query').addEventListener('input', renderAssetResults);
+byId('catalog-refresh').addEventListener('click', () => { void loadCatalog(true); });
+byId('asset-search-results').addEventListener('click', event => {
+  const button = (event.target as HTMLElement).closest<HTMLButtonElement>('[data-add]');
+  if (button?.dataset.add && !button.disabled) void addAsset(button.dataset.add);
+});
+byId('asset-search-form').addEventListener('submit', event => {
+  event.preventDefault();
+  const matches = matchingAssets();
+  const query = byId<HTMLInputElement>('asset-query').value.trim().toUpperCase().replace(/[\s/]/g, '');
+  const match = matches.find(a => a.symbol === query || a.baseAsset === query) ?? (matches.length === 1 ? matches[0] : undefined);
+  if (match && !catalogLoading && !catalogError && !assets.some(a => a.id === match.id)) void addAsset(match.symbol);
+});
+byId('settings-assets').addEventListener('click', async event => {
+  const button = (event.target as HTMLElement).closest<HTMLButtonElement>('[data-remove]');
+  if (!button?.dataset.remove || assetMutationBusy) return;
+  const id = button.dataset.remove;
+  const previous = selected;
+  assetMutationBusy = true;
+  renderSettingsAssets(); renderAssetResults();
+  try {
+    applyWatchlist(await native<WatchlistState>('removeAsset', { asset: id }));
+    if (previous !== selected) void loadHistory();
+    byId('settings-feedback').textContent = '已移除，自选和菜单栏已同步。';
+  } catch (error) { byId('settings-feedback').textContent = error instanceof Error ? error.message : '移除失败，请重试。'; }
+  finally { assetMutationBusy = false; renderSettingsAssets(); renderAssetResults(); }
+});
+
 function renderLoginItem() {
   const toggle = byId<HTMLInputElement>('launch-at-login');
   toggle.disabled = loginItemBusy || !loginItem || loginItem.status === 'unavailable';
@@ -603,27 +752,34 @@ byId('login-system-settings').addEventListener('click', () => {
     byId('startup-status').textContent = '请手动打开“系统设置 → 通用 → 登录项与扩展”。';
   });
 });
-byId('settings-open').addEventListener('click', () => {
-  document.querySelectorAll<HTMLInputElement>('[name="menu-asset"]').forEach(input => { input.checked = preferences.menuAssets.includes(input.value as AssetID); });
+function openSettings(search = false) {
+  renderSettingsAssets();
   settings.showModal();
   renderLoginItem();
   void refreshLoginItem();
-});
+  void loadCatalog();
+  if (search) byId<HTMLInputElement>('asset-query').focus();
+}
+byId('settings-open').addEventListener('click', () => openSettings());
+byId('assets-open').addEventListener('click', () => openSettings(true));
 byId('settings-close').addEventListener('click', () => settings.close());
 settings.addEventListener('click', event => { if (event.target === settings) settings.close(); });
-document.querySelectorAll<HTMLInputElement>('[name="menu-asset"]').forEach(input => input.addEventListener('change', async () => {
+byId('settings-assets').addEventListener('change', async event => {
+  const input = event.target as HTMLInputElement;
+  if (input.name !== 'menu-asset' || assetMutationBusy) return;
   const inputs = [...document.querySelectorAll<HTMLInputElement>('[name="menu-asset"]')];
   const menuAssets = inputs.filter(item => item.checked).map(item => item.value);
-  if (!menuAssets.length) { input.checked = true; byId('settings-feedback').textContent = '请至少保留一个菜单栏品种。'; return; }
-  inputs.forEach(item => { item.disabled = true; });
+  if (!menuAssets.length) { input.checked = true; byId('settings-feedback').textContent = '请至少保留一个显示品种。'; return; }
+  assetMutationBusy = true;
+  renderSettingsAssets(); renderAssetResults();
   try {
     preferences = await native<Preferences>('preferences', { menuAssets });
-    byId('settings-feedback').textContent = '已保存，菜单栏已更新。';
+    if (syncVisibleSelection()) void loadHistory();
+    byId('settings-feedback').textContent = '已保存，主页和菜单栏已同步更新。';
   } catch {
-    inputs.forEach(item => { item.checked = preferences.menuAssets.includes(item.value as AssetID); });
     byId('settings-feedback').textContent = '保存失败，请重试。';
-  } finally { inputs.forEach(item => { item.disabled = false; }); }
-}));
+  } finally { assetMutationBusy = false; renderSettingsAssets(); renderAssetResults(); }
+});
 byId('quit').addEventListener('click', () => { void native('quit').catch(() => {}); });
 function handleEscape() {
   const dialog = document.querySelector<HTMLDialogElement>('dialog[open]');
@@ -639,21 +795,21 @@ document.addEventListener('keydown', event => {
   if (event.key === 'Escape' && !event.isComposing) { event.preventDefault(); handleEscape(); return; }
   if (settings.open || research.hasDialog() || (event.target as HTMLElement).matches('input, select, textarea')) return;
   if (!event.metaKey && !event.ctrlKey && !event.altKey) {
-    if ('12345'.includes(event.key) && event.key.length === 1) selectAsset(assets[Number(event.key) - 1].id);
+    if ('123456789'.includes(event.key) && event.key.length === 1) {
+      const target = visibleAssets()[Number(event.key) - 1];
+      if (target) selectAsset(target.id);
+    }
     if (event.key.toLowerCase() === 'r') void refresh();
   }
 });
 
 renderSelection();
-void native<{ snapshot: Snapshot; preferences: Preferences; visible: boolean; tradingViewSymbols: Record<AssetID, string>; loginItem: LoginItemState }>('ready').then(value => {
+void native<WatchlistState & { visible: boolean; loginItem: LoginItemState }>('ready').then(value => {
   bridgeReady = true;
-  snapshot = value.snapshot;
-  preferences = value.preferences;
   visible = value.visible;
-  tradingViewSymbols = value.tradingViewSymbols;
   loginItem = value.loginItem;
   renderLoginItem();
-  renderSelection();
+  applyWatchlist(value);
   return loadHistory();
 }).catch(error => { chartState(error.message, true); byId('connection').innerHTML = '<i></i>等待原生应用'; });
 setInterval(() => {

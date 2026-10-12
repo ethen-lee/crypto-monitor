@@ -1,37 +1,44 @@
 import Foundation
 
-enum Asset: String, CaseIterable, Codable, Sendable {
-    case btc, eth, us10y, us30y, gold
+struct Asset: Codable, Equatable, Sendable {
+    enum Provider: String, Codable, Sendable { case coinbase, yahoo, binance }
+    let id: String
+    let name: String
+    let symbol: String
+    let baseAsset: String
+    let provider: Provider
+    let tickSize: Double
 
-    var symbol: String {
-        switch self {
-        case .btc: return "BTC-USD"
-        case .eth: return "ETH-USD"
-        case .us10y: return "^TNX"
-        case .us30y: return "^TYX"
-        case .gold: return "GC=F"
-        }
-    }
-    var label: String {
-        switch self {
-        case .btc: return "BTC"
-        case .eth: return "ETH"
-        case .us10y: return "10Y"
-        case .us30y: return "30Y"
-        case .gold: return "黄金"
-        }
-    }
-    var isCrypto: Bool { self == .btc || self == .eth }
-    var isYield: Bool { self == .us10y || self == .us30y }
+    static let btc = Asset(id: "btc", name: "比特币", symbol: "BTC-USD", baseAsset: "BTC", provider: .coinbase, tickSize: 0.01)
+    static let eth = Asset(id: "eth", name: "以太坊", symbol: "ETH-USD", baseAsset: "ETH", provider: .coinbase, tickSize: 0.01)
+    static let us10y = Asset(id: "us10y", name: "10 年期美债", symbol: "^TNX", baseAsset: "10Y", provider: .yahoo, tickSize: 0.001)
+    static let us30y = Asset(id: "us30y", name: "30 年期美债", symbol: "^TYX", baseAsset: "30Y", provider: .yahoo, tickSize: 0.001)
+    static let gold = Asset(id: "gold", name: "黄金永续", symbol: "XAUUSDT", baseAsset: "XAU", provider: .binance, tickSize: 0.01)
+    static let defaults: [Asset] = [.btc, .eth, .us10y, .us30y, .gold]
 
+    var label: String { isBinance ? "\(baseAsset)·P" : baseAsset }
+    var isCoinbase: Bool { provider == .coinbase }
+    var isYield: Bool { provider == .yahoo }
+    var isBinance: Bool { provider == .binance }
+    var cacheKey: String { "\(provider.rawValue):\(isBinance ? "perpetual" : isYield ? "yield" : "spot"):\(symbol)" }
+    var isCustom: Bool { !Self.defaults.contains(where: { $0.id == id }) }
+    var priceDecimals: Int {
+        let fraction = String(format: "%.12f", locale: Locale(identifier: "en_US_POSIX"), tickSize).split(separator: ".").last ?? ""
+        return fraction.replacingOccurrences(of: "0+$", with: "", options: .regularExpression).count
+    }
     var tradingViewSymbol: String {
-        switch self {
-        case .btc: return "COINBASE:BTCUSD"
-        case .eth: return "COINBASE:ETHUSD"
-        case .us10y: return "TVC:US10Y"
-        case .us30y: return "TVC:US30Y"
-        case .gold: return "COMEX:GC1!"
-        }
+        if isBinance { return "BINANCE:\(symbol).P" }
+        if isCoinbase { return "COINBASE:\(baseAsset)USD" }
+        return "TVC:US\(baseAsset)"
+    }
+
+    static func perpetual(symbol: String, baseAsset: String, tickSize: Double) -> Asset? {
+        guard symbol.hasSuffix("USDT"), !baseAsset.isEmpty,
+              symbol.range(of: "^[\\p{L}\\p{N}_]{1,60}$", options: .regularExpression) != nil,
+              baseAsset.range(of: "^[\\p{L}\\p{N}_]{1,50}$", options: .regularExpression) != nil,
+              tickSize.isFinite, tickSize >= 0.000000000001, tickSize <= 1_000_000 else { return nil }
+        if symbol == gold.symbol { return gold }
+        return Asset(id: "binance:perpetual:\(symbol)", name: baseAsset, symbol: symbol, baseAsset: baseAsset, provider: .binance, tickSize: tickSize)
     }
 }
 
@@ -45,7 +52,7 @@ struct Candle: Codable, Sendable {
 }
 
 struct Quote: Codable, Sendable {
-    let asset: Asset
+    let asset: String
     let price: Double
     let change: Double?
     let changePercent: Double?
@@ -58,7 +65,7 @@ struct Quote: Codable, Sendable {
 }
 
 struct History: Codable, Sendable {
-    let asset: Asset
+    let asset: String
     let interval: String
     let candles: [Candle]
     let fetchedAt: Double
@@ -77,12 +84,14 @@ private struct StoredData: Codable {
 
 enum MarketError: LocalizedError {
     case invalidResponse, unavailable(Int), noData, unsupportedInterval
+    case message(String)
     var errorDescription: String? {
         switch self {
         case .invalidResponse: return "行情源返回了无法读取的数据，请稍后重试。"
         case .unavailable(let status): return "行情源暂不可用（HTTP \(status)），请稍后重试。"
         case .noData: return "行情源暂未提供这个周期的数据。"
         case .unsupportedInterval: return "这个品种不支持所选周期。"
+        case .message(let message): return message
         }
     }
 }
@@ -91,6 +100,11 @@ actor MarketClient {
     private let session: URLSession
     private let cacheURL: URL
     private var stored: StoredData
+    private var catalog: [Asset] = []
+    private var catalogFetchedAt = Date.distantPast
+    private var catalogRequest: Task<[Asset], Error>?
+    private var activeRequests = 0
+    private var hostBackoff: [String: Date] = [:]
 
     init() {
         let config = URLSessionConfiguration.ephemeral
@@ -103,21 +117,29 @@ actor MarketClient {
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         cacheURL = directory.appendingPathComponent("market-cache.json")
         stored = (try? JSONDecoder().decode(StoredData.self, from: Data(contentsOf: cacheURL))) ?? StoredData()
+        // Only migrate unchanged markets. Legacy gold keys contain COMEX futures.
+        for asset in Asset.defaults where !asset.isBinance {
+            if stored.quotes[asset.cacheKey] == nil { stored.quotes[asset.cacheKey] = stored.quotes[asset.id] }
+            for interval in ["1m", "15m", "1h", "6h", "1d", "1w"] {
+                let key = asset.cacheKey + ":" + interval
+                if stored.histories[key] == nil { stored.histories[key] = stored.histories[asset.id + ":" + interval] }
+            }
+        }
     }
 
-    func cachedSnapshot() -> Snapshot {
-        Snapshot(quotes: Asset.allCases.compactMap { asset in
-            guard var quote = stored.quotes[asset.rawValue] else { return nil }
+    func cachedSnapshot(assets: [Asset]) -> Snapshot {
+        Snapshot(quotes: assets.compactMap { asset in
+            guard var quote = stored.quotes[asset.cacheKey] else { return nil }
             quote.cached = true
             return quote
         }, errors: [:])
     }
 
-    func snapshot(force: Bool = false) async -> Snapshot {
+    func snapshot(assets: [Asset], force: Bool = false) async -> Snapshot {
         var quotes: [Quote] = []
         var errors: [String: String] = [:]
         await withTaskGroup(of: (Asset, Quote?, String?).self) { group in
-            for asset in Asset.allCases {
+            for asset in assets {
                 group.addTask {
                     do { return (asset, try await self.quote(asset, force: force), nil) }
                     catch { return (asset, nil, error.localizedDescription) }
@@ -126,8 +148,8 @@ actor MarketClient {
             for await (asset, quote, error) in group {
                 if let quote { quotes.append(quote) }
                 if let error {
-                    errors[asset.rawValue] = error
-                    if var cached = stored.quotes[asset.rawValue] {
+                    errors[asset.id] = error
+                    if var cached = stored.quotes[asset.cacheKey] {
                         cached.cached = true
                         quotes.append(cached)
                     }
@@ -140,11 +162,21 @@ actor MarketClient {
 
     private func quote(_ asset: Asset, force: Bool) async throws -> Quote {
         let now = Date().timeIntervalSince1970
-        if !force, let cached = stored.quotes[asset.rawValue], now - cached.fetchedAt < (asset.isCrypto ? 25 : 55) {
+        if !force, let cached = stored.quotes[asset.cacheKey], now - cached.fetchedAt < (asset.isYield ? 55 : 25) {
             return cached
         }
         let quote: Quote
-        if asset.isCrypto {
+        if asset.isBinance {
+            let data = try await request(host: "fapi.binance.com", path: "/fapi/v1/ticker/24hr", query: ["symbol": asset.symbol])
+            let ticker = try JSONDecoder().decode(BinanceTicker.self, from: data)
+            guard ticker.symbol == asset.symbol,
+                  let price = Double(ticker.lastPrice), price.isFinite, price > 0,
+                  ticker.closeTime.isFinite, ticker.closeTime > 0 else { throw MarketError.invalidResponse }
+            quote = Quote(asset: asset.id, price: price, change: try finiteNumber(ticker.priceChange),
+                          changePercent: try finiteNumber(ticker.priceChangePercent), high: try finiteNumber(ticker.highPrice),
+                          low: try finiteNumber(ticker.lowPrice), volume: try finiteNumber(ticker.volume),
+                          timestamp: ticker.closeTime / 1000, fetchedAt: now)
+        } else if asset.isCoinbase {
             async let statsData = request(host: "api.exchange.coinbase.com", path: "/products/\(asset.symbol)/stats")
             async let tickerData = request(host: "api.exchange.coinbase.com", path: "/products/\(asset.symbol)/ticker")
             let stats = try JSONDecoder().decode(CoinbaseStats.self, from: await statsData)
@@ -155,7 +187,7 @@ actor MarketClient {
             parser.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
             let timestamp = parser.date(from: ticker.time) ?? ISO8601DateFormatter().date(from: ticker.time)
             guard let timestamp else { throw MarketError.invalidResponse }
-            quote = Quote(asset: asset, price: price, change: price - open, changePercent: (price / open - 1) * 100,
+            quote = Quote(asset: asset.id, price: price, change: price - open, changePercent: (price / open - 1) * 100,
                           high: Double(stats.high), low: Double(stats.low), volume: Double(stats.volume),
                           timestamp: timestamp.timeIntervalSince1970, fetchedAt: now)
         } else {
@@ -168,24 +200,36 @@ actor MarketClient {
             let change = meta.fulldayChange ?? previous.map { price - $0 }
             let reference = change.map { price - $0 }
             let percent = reference.flatMap { $0 > 0 ? (price / $0 - 1) * 100 : nil }
-            quote = Quote(asset: asset, price: price, change: change, changePercent: percent,
+            quote = Quote(asset: asset.id, price: price, change: change, changePercent: percent,
                           high: meta.regularMarketDayHigh, low: meta.regularMarketDayLow,
                           volume: asset.isYield ? nil : meta.regularMarketVolume,
                           timestamp: timestamp, fetchedAt: now)
         }
-        stored.quotes[asset.rawValue] = quote
+        stored.quotes[asset.cacheKey] = quote
         return quote
     }
 
     func history(_ asset: Asset, interval: String, force: Bool = false) async throws -> History {
         let supported = asset.isYield ? ["1d", "1w"] : ["1m", "15m", "1h", "6h", "1d", "1w"]
         guard supported.contains(interval) else { throw MarketError.unsupportedInterval }
-        let key = asset.rawValue + ":" + interval
+        let key = asset.cacheKey + ":" + interval
         let now = Date().timeIntervalSince1970
         if !force, let cached = stored.histories[key], now - cached.fetchedAt < (interval == "1m" ? 10 : 55) { return cached }
         do {
             let candles: [Candle]
-            if asset.isCrypto {
+            if asset.isBinance {
+                let data = try await request(host: "fapi.binance.com", path: "/fapi/v1/klines", query: [
+                    "symbol": asset.symbol, "interval": interval, "limit": "1000",
+                ])
+                guard let rows = try JSONSerialization.jsonObject(with: data) as? [[Any]] else { throw MarketError.invalidResponse }
+                candles = normalize(try rows.map { row in
+                    guard row.count >= 6, let timestamp = row[0] as? NSNumber,
+                          let open = row[1] as? String, let high = row[2] as? String, let low = row[3] as? String,
+                          let close = row[4] as? String, let volume = row[5] as? String else { throw MarketError.invalidResponse }
+                    return Candle(time: timestamp.intValue / 1000, open: try finiteNumber(open), high: try finiteNumber(high),
+                                  low: try finiteNumber(low), close: try finiteNumber(close), volume: try finiteNumber(volume))
+                })
+            } else if asset.isCoinbase {
                 let granularity = ["1m": 60, "15m": 900, "1h": 3600, "6h": 21600, "1d": 86400, "1w": 86400][interval]!
                 let end = Date()
                 let start = end.addingTimeInterval(-Double(granularity * 299))
@@ -222,7 +266,7 @@ actor MarketClient {
                 candles = aggregate(rows, seconds: seconds, offset: interval == "1w" ? 345600 : 0)
             }
             guard !candles.isEmpty else { throw MarketError.noData }
-            let history = History(asset: asset, interval: interval, candles: candles, fetchedAt: now)
+            let history = History(asset: asset.id, interval: interval, candles: candles, fetchedAt: now)
             stored.histories[key] = history
             save()
             return history
@@ -233,6 +277,37 @@ actor MarketClient {
             }
             throw error
         }
+    }
+
+    func perpetualCatalog(force: Bool = false) async throws -> [Asset] {
+        if !force, Date().timeIntervalSince(catalogFetchedAt) < 300 { return catalog }
+        if let catalogRequest { return try await catalogRequest.value }
+        let task = Task { try await self.fetchPerpetualCatalog() }
+        catalogRequest = task
+        defer { catalogRequest = nil }
+        let result = try await task.value
+        catalog = result
+        catalogFetchedAt = Date()
+        return result
+    }
+
+    private func fetchPerpetualCatalog() async throws -> [Asset] {
+        let data = try await request(host: "fapi.binance.com", path: "/fapi/v1/exchangeInfo")
+        let info = try JSONDecoder().decode(BinanceExchangeInfo.self, from: data)
+        let assets = info.symbols.compactMap { item -> Asset? in
+            guard item.status == "TRADING", ["PERPETUAL", "TRADIFI_PERPETUAL"].contains(item.contractType),
+                  item.quoteAsset == "USDT", item.marginAsset == "USDT",
+                  let tick = item.filters.first(where: { $0.filterType == "PRICE_FILTER" })?.tickSize,
+                  let tickSize = Double(tick) else { return nil }
+            return Asset.perpetual(symbol: item.symbol, baseAsset: item.baseAsset, tickSize: tickSize)
+        }
+        guard !assets.isEmpty else { throw MarketError.noData }
+        return assets.sorted { $0.symbol < $1.symbol }
+    }
+
+    private func finiteNumber(_ value: String) throws -> Double {
+        guard let number = Double(value), number.isFinite else { throw MarketError.invalidResponse }
+        return number
     }
 
     private func normalize(_ rows: [Candle]) -> [Candle] {
@@ -263,6 +338,12 @@ actor MarketClient {
     }
 
     private func request(host: String, path: String, query: [String: String] = [:]) async throws -> Data {
+        while activeRequests >= 3 { try await Task.sleep(nanoseconds: 100_000_000) }
+        if let until = hostBackoff[host], until > Date() {
+            throw MarketError.message("行情源暂缓请求，\(Int(ceil(until.timeIntervalSinceNow))) 秒后可重试。")
+        }
+        activeRequests += 1
+        defer { activeRequests -= 1 }
         var components = URLComponents()
         components.scheme = "https"
         components.host = host
@@ -271,7 +352,23 @@ actor MarketClient {
         guard let url = components.url else { throw MarketError.invalidResponse }
         let (data, response) = try await session.data(from: url)
         guard let response = response as? HTTPURLResponse else { throw MarketError.invalidResponse }
-        guard (200..<300).contains(response.statusCode) else { throw MarketError.unavailable(response.statusCode) }
+        guard (200..<300).contains(response.statusCode) else {
+            let status = response.statusCode
+            if [403, 418, 429, 451].contains(status) {
+                var delay: Double = status == 429 ? 60 : 3600
+                if let retry = response.value(forHTTPHeaderField: "Retry-After") {
+                    if let seconds = Double(retry) { delay = max(delay, seconds) }
+                    else {
+                        let parser = DateFormatter()
+                        parser.locale = Locale(identifier: "en_US_POSIX")
+                        parser.dateFormat = "EEE, dd MMM yyyy HH:mm:ss z"
+                        if let date = parser.date(from: retry) { delay = max(delay, date.timeIntervalSinceNow) }
+                    }
+                }
+                hostBackoff[host] = Date().addingTimeInterval(delay)
+            }
+            throw MarketError.unavailable(status)
+        }
         return data
     }
 
@@ -282,6 +379,18 @@ actor MarketClient {
 
 private struct CoinbaseStats: Decodable { let open, high, low, volume: String }
 private struct CoinbaseTicker: Decodable { let price, time: String }
+private struct BinanceTicker: Decodable {
+    let symbol, lastPrice, priceChange, priceChangePercent, highPrice, lowPrice, volume: String
+    let closeTime: Double
+}
+private struct BinanceExchangeInfo: Decodable {
+    let symbols: [Symbol]
+    struct Symbol: Decodable {
+        let symbol, baseAsset, quoteAsset, marginAsset, contractType, status: String
+        let filters: [Filter]
+    }
+    struct Filter: Decodable { let filterType: String; let tickSize: String? }
+}
 private struct YahooEnvelope: Decodable {
     let chart: Chart
     struct Chart: Decodable { let result: [YahooResult]? }

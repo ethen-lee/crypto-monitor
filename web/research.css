@@ -1,7 +1,7 @@
 .open-research { display: inline-flex; align-items: center; gap: 4px; color: #bdcaff; background: #293953; border: 1px solid #46577a; border-radius: 5px; font-size: 10px; padding: 6px 8px; margin-right: 6px; white-space: nowrap; }
 .open-research:hover { color: #fff; background: #344b6d; }
 .research-page .shell { grid-template-rows: 58px minmax(0, 1fr) 40px; }
-.research-page .watchlist, .research-page #connection { display: none; }
+.research-page .watchlist-bar, .research-page #connection { display: none; }
 .research-back { font-size: 11px; color: #cdd7ff; padding: 6px 12px 6px 0; border-right: 1px solid var(--line); margin-right: 4px; }
 .research-back:hover { color: #fff; }
 .research-workspace { padding-top: 17px; }
